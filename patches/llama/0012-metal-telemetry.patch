@@ -1,0 +1,993 @@
+diff --git a/ggml/src/ggml-metal/CMakeLists.txt b/ggml/src/ggml-metal/CMakeLists.txt
+index c8e9282f0..4df44086b 100644
+--- a/ggml/src/ggml-metal/CMakeLists.txt
++++ b/ggml/src/ggml-metal/CMakeLists.txt
+@@ -15,16 +15,28 @@ ggml_add_backend_library(ggml-metal
+                         )
+ 
+ target_link_libraries(ggml-metal PRIVATE
+                       ${FOUNDATION_LIBRARY}
+                       ${METAL_FRAMEWORK}
+                       ${METALKIT_FRAMEWORK}
+                       )
+ 
++# ToshLLM Phase-0 telemetry (patch 0055): ObjC glue + the tosh-telemetry Rust
++# staticlib. Inert at runtime unless TOSH_TELEMETRY=1|2 is set.
++option(GGML_METAL_TELEMETRY "ggml-metal: tosh-telemetry instrumentation" OFF)
++if (GGML_METAL_TELEMETRY)
++    if (NOT TOSH_TELEMETRY_STATICLIB)
++        message(FATAL_ERROR "GGML_METAL_TELEMETRY=ON requires -DTOSH_TELEMETRY_STATICLIB=/path/to/libtosh_telemetry.a")
++    endif()
++    target_compile_definitions(ggml-metal PRIVATE GGML_METAL_TELEMETRY)
++    target_sources(ggml-metal PRIVATE ggml-metal-telemetry.m)
++    target_link_libraries(ggml-metal PRIVATE ${TOSH_TELEMETRY_STATICLIB})
++endif()
++
+ if (GGML_METAL_NDEBUG)
+     add_compile_definitions(GGML_METAL_NDEBUG)
+ endif()
+ 
+ set(METALLIB_COMMON "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-common.h")
+ set(METALLIB_KERNELS_COMMON     "${CMAKE_CURRENT_SOURCE_DIR}/kernels/common.h")
+ set(METALLIB_KERNELS_DEQUANTIZE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/dequantize.h")
+ set(METALLIB_KERNELS_QUANTIZE   "${CMAKE_CURRENT_SOURCE_DIR}/kernels/quantize.h")
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 5ef272ec2..7422aeb09 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -10,16 +10,41 @@
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+ #include "tosh-moe.h"
+ #endif
+ 
+ #import <Foundation/Foundation.h>
+ 
+ #import <Metal/Metal.h>
+ 
++#if GGML_METAL_TELEMETRY
++#include <stdatomic.h>
++#import "ggml-metal-telemetry.h"
++
++// one relaxed load + one branch per site when telemetry is built in but off
++#define TOSH_TELE_MODE() atomic_load_explicit(&tosh_tele_g_mode, memory_order_relaxed)
++#define TOSH_TELE_DEV(ctx) tosh_tele_dev_index(ggml_metal_device_get_obj((ctx)->dev))
++#define TOSH_TELE_BLIT(ctx, kind, nbytes) do { \
++    if (TOSH_TELE_MODE()) { \
++        tosh_tele_blit((uint32_t) TOSH_TELE_DEV(ctx), (uint32_t)(kind), (uint64_t)(nbytes), 0); \
++    } \
++} while (0)
++#define TOSH_TELE_BLIT_X(ctx, kind, nbytes, dst_ctx) do { \
++    if (TOSH_TELE_MODE()) { \
++        tosh_tele_blit((uint32_t) TOSH_TELE_DEV(ctx), (uint32_t)(kind), (uint64_t)(nbytes), \
++                       (uint32_t) TOSH_TELE_DEV(dst_ctx)); \
++    } \
++} while (0)
++#define TOSH_TELE_EV(ctx, kind, sig, val) do { \
++    if (TOSH_TELE_MODE()) { \
++        tosh_tele_ev((uint32_t) TOSH_TELE_DEV(ctx), (uint32_t)(kind), (uint32_t)(sig), (uint64_t)(val)); \
++    } \
++} while (0)
++#endif
++
+ #undef MIN
+ #undef MAX
+ #define MIN(a, b) ((a) < (b) ? (a) : (b))
+ #define MAX(a, b) ((a) > (b) ? (a) : (b))
+ 
+ // max number of MTLCommandBuffer used to submit a graph for processing
+ #define GGML_METAL_MAX_COMMAND_BUFFERS 8
+ #define GGML_METAL_MAX_PENDING_WAITS   8
+@@ -163,16 +188,19 @@ static bool ggml_metal_defer_waits(void) {
+ static void ggml_metal_encode_pending_waits(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf) {
+     for (int i = 0; i < ctx->n_ev_wait_pending; ++i) {
+         ggml_metal_event_encode_wait(ctx->ev_wait_pending[i], (ggml_metal_cmd_buf_t) cmd_buf);
+     }
+     ctx->n_ev_wait_pending = 0;
+ 
+     for (int i = 0; i < ctx->n_peer_waits; ++i) {
+         [cmd_buf encodeWaitForEvent:ctx->peer_waits[i].ev value:ctx->peer_waits[i].val];
++#if GGML_METAL_TELEMETRY
++        TOSH_TELE_EV(ctx, 2, 0, ctx->peer_waits[i].val);
++#endif
+     }
+     ctx->n_peer_waits = 0;
+ }
+ 
+ static void ggml_metal_cmd_buf_submit(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf) {
+     [cmd_buf commit];
+     [ctx->cmd_bufs_ext addObject:cmd_buf];
+     ctx->cmd_buf_last = cmd_buf;
+@@ -233,16 +261,19 @@ static void ggml_metal_peer_wait_add(ggml_metal_t ctx, id<MTLSharedEvent> ev, ui
+         ctx->n_peer_waits++;
+         return;
+     }
+ 
+     @autoreleasepool {
+         id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
+         ggml_metal_encode_pending_waits(ctx, cmd_buf);
+         [cmd_buf encodeWaitForEvent:ev value:val];
++#if GGML_METAL_TELEMETRY
++        TOSH_TELE_EV(ctx, 2, 0, val);
++#endif
+         ggml_metal_cmd_buf_submit(ctx, cmd_buf);
+     }
+ }
+ 
+ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev, bool prefetch) {
+     GGML_LOG_INFO("%s: allocating\n", __func__);
+ 
+     @autoreleasepool {
+@@ -586,16 +617,19 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor,
+                     offs_src = 0;
+                 }
+             }
+ 
+             if (buf_src != nil) {
+                 id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
+                 ggml_metal_encode_pending_waits(ctx, cmd_buf);
+                 id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
++#if GGML_METAL_TELEMETRY
++                TOSH_TELE_BLIT(ctx, 1, size);
++#endif
+ 
+                 [encoder copyFromBuffer:buf_src
+                            sourceOffset:offs_src
+                                toBuffer:bid_dst.metal
+                       destinationOffset:bid_dst.offs
+                                    size:size];
+ 
+                 [encoder endEncoding];
+@@ -613,32 +647,38 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor,
+             }
+         }
+ 
+         // private buffers route small transfers through the device staging
+         // buffer (synchronous) instead of allocating a Metal buffer per call
+         ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+         if (!ctx->owns_queue && !ggml_metal_buffer_is_shared(buffer->context)
+             && ggml_metal_device_stage_set(ctx->dev, bid_dst, data, size)) {
++#if GGML_METAL_TELEMETRY
++            TOSH_TELE_BLIT(ctx, 6, size);
++#endif
+             return;
+         }
+ 
+         // wrap the source data into a Metal buffer
+         id<MTLBuffer> buf_src = [device newBufferWithBytes:data
+                                                     length:size
+                                                    options:MTLResourceStorageModeShared];
+ 
+         GGML_ASSERT(buf_src);
+ 
+         // queue the copy operation into the queue of the Metal context
+         // this will be queued at the end, after any currently ongoing GPU operations
+         id<MTLCommandQueue> queue = ctx->queue;
+         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+         ggml_metal_encode_pending_waits(ctx, cmd_buf);
+         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
++#if GGML_METAL_TELEMETRY
++        TOSH_TELE_BLIT(ctx, 1, size);
++#endif
+ 
+         [encoder copyFromBuffer:buf_src
+                    sourceOffset:0
+                        toBuffer:bid_dst.metal
+               destinationOffset:bid_dst.offs
+                            size:size];
+ 
+         [encoder endEncoding];
+@@ -672,32 +712,38 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
+ 
+         bid_src.offs += offset;
+ 
+         // private buffers route small transfers through the device staging
+         // buffer (synchronous) instead of allocating a Metal buffer per call
+         ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+         if (!ggml_metal_buffer_is_shared(buffer->context)
+             && ggml_metal_device_stage_get(ctx->dev, bid_src, data, size)) {
++#if GGML_METAL_TELEMETRY
++            TOSH_TELE_BLIT(ctx, 2, size);
++#endif
+             return;
+         }
+ 
+         id<MTLCommandQueue> queue = ctx->queue;
+ 
+         id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
+                                                           length:size
+                                                          options:MTLResourceStorageModeShared
+                                                      deallocator:nil];
+ 
+         if (buf_dst != nil) {
+             // queue the copy operation into the queue of the Metal context
+             // this will be queued at the end, after any currently ongoing GPU operations
+             id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+             ggml_metal_encode_pending_waits(ctx, cmd_buf);
+             id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
++#if GGML_METAL_TELEMETRY
++            TOSH_TELE_BLIT(ctx, 2, size);
++#endif
+ 
+             [encoder copyFromBuffer:bid_src.metal
+                        sourceOffset:bid_src.offs
+                            toBuffer:buf_dst
+                   destinationOffset:0
+                                size:size];
+ 
+             [encoder endEncoding];
+@@ -737,16 +783,19 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
+         for (size_t done = 0; done < size;) {
+             const size_t n = MIN(stage_size, size - done);
+ 
+             id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+             ggml_metal_encode_pending_waits(ctx, cmd_buf);
+ 
+             {
+                 id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
++#if GGML_METAL_TELEMETRY
++                TOSH_TELE_BLIT(ctx, 2, n);
++#endif
+ 
+                 [encoder copyFromBuffer:bid_src.metal
+                            sourceOffset:bid_src.offs + done
+                                toBuffer:buf_stage
+                       destinationOffset:0
+                                    size:n];
+ 
+                 [encoder endEncoding];
+@@ -854,29 +903,41 @@ static bool ggml_metal_cpy_xdev_peer(ggml_metal_t ctx_src, ggml_metal_t ctx_dst,
+             }
+         }
+ 
+         const uint64_t seq = ++link->seq;
+         @autoreleasepool {
+             id<MTLCommandBuffer> cmd_src = [ctx_src->queue commandBuffer];
+             ggml_metal_encode_pending_waits(ctx_src, cmd_src);
+             [cmd_src encodeSignalEvent:link->ev_ready value:seq];
++#if GGML_METAL_TELEMETRY
++            TOSH_TELE_EV(ctx_src, 1, 1, seq);
++#endif
+             [cmd_src commit];
+             [ctx_src->cmd_bufs_ext addObject:cmd_src];
+             ctx_src->cmd_buf_last = cmd_src;
+             [cmd_src retain];
+ 
+             id<MTLCommandBuffer> cmd_dst = [ctx_dst->queue commandBuffer];
+             ggml_metal_encode_pending_waits(ctx_dst, cmd_dst);
+             [cmd_dst encodeWaitForEvent:link->ev_ready value:seq];
++#if GGML_METAL_TELEMETRY
++            TOSH_TELE_EV(ctx_dst, 1, 0, seq);
++#endif
+             id<MTLBlitCommandEncoder> encoder = [cmd_dst blitCommandEncoder];
++#if GGML_METAL_TELEMETRY
++            TOSH_TELE_BLIT_X(ctx_dst, 4, size, ctx_src);
++#endif
+             [encoder copyFromBuffer:link->peer_view sourceOffset:bid_src.offs
+                            toBuffer:metal_dst destinationOffset:bid_dst.offs size:size];
+             [encoder endEncoding];
+             [cmd_dst encodeSignalEvent:link->ev_done value:seq];
++#if GGML_METAL_TELEMETRY
++            TOSH_TELE_EV(ctx_dst, 1, 1, seq);
++#endif
+             [cmd_dst commit];
+             [ctx_dst->cmd_bufs_ext addObject:cmd_dst];
+             ctx_dst->cmd_buf_last = cmd_dst;
+             [cmd_dst retain];
+         }
+ 
+         ggml_metal_peer_wait_add(ctx_src, link->ev_done, seq);
+ 
+@@ -964,31 +1025,49 @@ static bool ggml_metal_cpy_xdev_events(ggml_metal_t ctx_src, ggml_metal_t ctx_ds
+ 
+     const uint64_t seq = ++link->seq;
+ 
+     @autoreleasepool {
+         // reuse the host block only after the destination consumed the last hand-off
+         id<MTLCommandBuffer> cmd_src = ggml_metal_cmd_buf_new(ctx_src);
+         if (seq > 1) {
+             [cmd_src encodeWaitForEvent:link->ev_done value:seq - 1];
++#if GGML_METAL_TELEMETRY
++            TOSH_TELE_EV(ctx_src, 1, 0, seq - 1);
++#endif
+         }
+         id<MTLBlitCommandEncoder> enc_src = [cmd_src blitCommandEncoder];
++#if GGML_METAL_TELEMETRY
++        TOSH_TELE_BLIT_X(ctx_src, 5, size, ctx_dst);
++#endif
+         [enc_src copyFromBuffer:bid_src.metal sourceOffset:bid_src.offs
+                        toBuffer:link->wrap_src destinationOffset:0 size:size];
+         [enc_src endEncoding];
+         [cmd_src encodeSignalEvent:link->ev_ready value:seq];
++#if GGML_METAL_TELEMETRY
++        TOSH_TELE_EV(ctx_src, 1, 1, seq);
++#endif
+         ggml_metal_cmd_buf_end(ctx_src, cmd_src, false);
+ 
+         id<MTLCommandBuffer> cmd_dst = ggml_metal_cmd_buf_new(ctx_dst);
+         [cmd_dst encodeWaitForEvent:link->ev_ready value:seq];
++#if GGML_METAL_TELEMETRY
++        TOSH_TELE_EV(ctx_dst, 1, 0, seq);
++#endif
+         id<MTLBlitCommandEncoder> enc_dst = [cmd_dst blitCommandEncoder];
++#if GGML_METAL_TELEMETRY
++        TOSH_TELE_BLIT_X(ctx_dst, 5, size, ctx_src);
++#endif
+         [enc_dst copyFromBuffer:link->wrap_dst sourceOffset:0
+                        toBuffer:bid_dst.metal destinationOffset:bid_dst.offs size:size];
+         [enc_dst endEncoding];
+         [cmd_dst encodeSignalEvent:link->ev_done value:seq];
++#if GGML_METAL_TELEMETRY
++        TOSH_TELE_EV(ctx_dst, 1, 1, seq);
++#endif
+         // the signal lands when the blit does, so holding the buffer open does not keep the
+         // source waiting on whatever gets encoded into it afterwards
+         ggml_metal_cmd_buf_end(ctx_dst, cmd_dst, hold_dst);
+     }
+ 
+     return true;
+ }
+ 
+@@ -1061,16 +1140,19 @@ bool ggml_metal_cpy_tensor_async_ex(ggml_metal_t ctx_src, ggml_metal_t ctx_dst,
+         }
+ 
+         // queue the copy operation into the Metal context
+         // this will be queued at the end, after any currently ongoing GPU operations
+         id<MTLCommandQueue> queue = ctx_src->queue;
+         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+         ggml_metal_encode_pending_waits(ctx_src, cmd_buf);
+         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
++#if GGML_METAL_TELEMETRY
++        TOSH_TELE_BLIT(ctx_src, 3, ggml_nbytes(src));
++#endif
+ 
+         [encoder copyFromBuffer:bid_src.metal
+                    sourceOffset:bid_src.offs
+                        toBuffer:bid_dst.metal
+               destinationOffset:bid_dst.offs
+                            size:ggml_nbytes(src)];
+ 
+         [encoder endEncoding];
+@@ -1833,16 +1915,22 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+ #endif
+ 
+     // number of nodes encoded by the main thread (empirically determined)
+     const int n_main = MAX(64, 0.1*gf->n_nodes);
+ 
+     // number of threads in addition to the main thread
+     const int n_cb = ctx->n_cb;
+ 
++#if GGML_METAL_TELEMETRY
++    const unsigned int tele_mode = TOSH_TELE_MODE();
++    const int      tele_dev   = tele_mode ? TOSH_TELE_DEV(ctx) : 0;
++    const uint64_t tele_graph = tele_mode ? tosh_tele_graph_begin((uint32_t) tele_dev, (uint64_t) gf->n_nodes) : 0;
++#endif
++
+     // keep the memory wired
+     ggml_metal_device_rsets_keep_alive(ctx->dev);
+ 
+     // submit the ggml compute graph to the GPU by creating command buffers and encoding the ops in them
+     // the first n_nodes_0 are encoded and submitted for processing directly by the calling thread
+     // while these nodes are processing, we start n_cb threads to enqueue the rest of the nodes
+     // each thread creates it's own command buffer and enqueues the ops in parallel
+     //
+@@ -1962,59 +2050,79 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+ 
+                 MTLCommandBufferStatus status = [cmd_buf status];
+                 if (status != MTLCommandBufferStatusCompleted) {
+                     GGML_LOG_INFO("%s: command buffer %d failed with status %lu\n", __func__, n_cb, status);
+                     if (status == MTLCommandBufferStatusError) {
+                         GGML_LOG_INFO("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+                     }
+ 
++#if GGML_METAL_TELEMETRY
++                    if (tele_mode) {
++                        tosh_tele_graph_end((uint32_t) tele_dev, tele_graph, (uint64_t) gf->n_nodes, (uint32_t) ctx->n_cb, 1);
++                    }
++#endif
+                     return GGML_STATUS_FAILED;
+                 }
+             }
+ 
+             for (int i = 0; i < n_cb; ++i) {
+                 id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[i].obj;
+                 [cmd_buf waitUntilCompleted];
+ 
+                 MTLCommandBufferStatus status = [cmd_buf status];
+                 if (status != MTLCommandBufferStatusCompleted) {
+                     GGML_LOG_INFO("%s: command buffer %d failed with status %lu\n", __func__, i, status);
+                     if (status == MTLCommandBufferStatusError) {
+                         GGML_LOG_INFO("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+                     }
+ 
++#if GGML_METAL_TELEMETRY
++                    if (tele_mode) {
++                        tosh_tele_graph_end((uint32_t) tele_dev, tele_graph, (uint64_t) gf->n_nodes, (uint32_t) ctx->n_cb, 1);
++                    }
++#endif
+                     return GGML_STATUS_FAILED;
+                 }
+ 
+                 id<MTLCommandBuffer> next_buffer = (i + 1 < n_cb ? ctx->cmd_bufs[i + 1].obj : nil);
+                 if (!next_buffer) {
+                     continue;
+                 }
+ 
+                 const bool next_queued = ([next_buffer status] != MTLCommandBufferStatusNotEnqueued);
+                 if (next_queued) {
+                     continue;
+                 }
+ 
+                 if (ctx->abort_callback && ctx->abort_callback(ctx->abort_callback_data)) {
+                     GGML_LOG_INFO("%s: command buffer %d aborted", __func__, i);
++#if GGML_METAL_TELEMETRY
++                    if (tele_mode) {
++                        tosh_tele_graph_end((uint32_t) tele_dev, tele_graph, (uint64_t) gf->n_nodes, (uint32_t) ctx->n_cb, 1);
++                    }
++#endif
+                     return GGML_STATUS_ABORTED;
+                 }
+ 
+                 [next_buffer commit];
+             }
+ 
+             [ctx->capture_scope endScope];
+             [[MTLCaptureManager sharedCaptureManager] stopCapture];
+ 
+             ctx->capture_started = false;
+         }
+     }
+ 
++#if GGML_METAL_TELEMETRY
++    if (tele_mode) {
++        tosh_tele_graph_end((uint32_t) tele_dev, tele_graph, (uint64_t) gf->n_nodes, (uint32_t) ctx->n_cb, 0);
++    }
++#endif
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+ // the reorder gains on dense decode but disturbs the expert chain on MoE, so this stays
+ // narrow on purpose
+ static bool ggml_metal_graph_is_moe_decode(const struct ggml_cgraph * gf, int max_tokens) {
+     bool has_experts = false;
+ 
+@@ -2125,16 +2233,26 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+ 
+         if (cb_idx < n_cb_l) {
+             idx_start = n_nodes_0 + (                                         (cb_idx + 0) * n_nodes_per_cb);
+             idx_end   = n_nodes_0 + (MIN((cb_idx == n_cb_l - 1) ? n_nodes_1 : (cb_idx + 1) * n_nodes_per_cb, n_nodes_1));
+         }
+ 
+         id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
+ 
++#if GGML_METAL_TELEMETRY
++        const unsigned int tele_mode = TOSH_TELE_MODE();
++        const int      tele_dev   = tele_mode ? TOSH_TELE_DEV(ctx) : 0;
++        // capture the graph ordinal up front: after commit, CB completion lets
++        // the main thread run graph_end (clearing cur_graph) before this encode
++        // thread reaches the cb_cpu call below, misattributing it to graph 0
++        const uint64_t tele_graph = tele_mode ? tosh_tele_current_graph((uint32_t) tele_dev) : 0;
++        const uint64_t tele_t0    = tele_mode ? tosh_tele_uptime_ns() : 0;
++#endif
++
+         ggml_metal_op_t ctx_op = ggml_metal_op_init(
+             ctx->dev,
+             cmd_buf,
+             ctx->gf,
+             idx_start,
+             idx_end,
+             ctx->use_fusion,
+             ctx->use_concurrency,
+@@ -2148,18 +2266,35 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+                 break;
+             }
+ 
+             idx += res - 1;
+         }
+ 
+         ggml_metal_op_free(ctx_op);
+ 
++#if GGML_METAL_TELEMETRY
++        const uint64_t tele_t1 = tele_mode ? tosh_tele_uptime_ns() : 0;
++#endif
++
+         if (cb_idx < 2 || ctx->abort_callback == NULL) {
++#if GGML_METAL_TELEMETRY
++            if (tele_mode) {
++                // handlers must be registered before commit (macOS 26 asserts)
++                tosh_tele_objc_cb_attach(cmd_buf, tele_dev, cb_idx);
++            }
++#endif
+             [cmd_buf commit];
++#if GGML_METAL_TELEMETRY
++            if (tele_mode) {
++                // graph ordinal captured before commit (see above)
++                tosh_tele_cb_cpu((uint32_t) tele_dev, tele_graph,
++                                 (uint32_t) cb_idx, (uint32_t) n_cb_l, tele_t0, tele_t1, tosh_tele_uptime_ns());
++            }
++#endif
+         }
+     });
+ }
+ 
+ void ggml_metal_set_abort_callback(ggml_metal_t ctx, ggml_abort_callback abort_callback, void * user_data) {
+     ctx->abort_callback = abort_callback;
+     ctx->abort_callback_data = user_data;
+ }
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index ff186fef0..007ea2b03 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -17,16 +17,22 @@ static inline int tosh_moe_mode(void) { return TOSH_MOE_OFF; }
+ 
+ #include <stdatomic.h>
+ #include <unistd.h>
+ 
+ #ifndef TARGET_OS_VISION
+ #define TARGET_OS_VISION 0
+ #endif
+ 
++#if GGML_METAL_TELEMETRY
++#include <string.h>
++#import "ggml-metal-telemetry.h"
++#define TOSH_TELE_MODE() atomic_load_explicit(&tosh_tele_g_mode, memory_order_relaxed)
++#endif
++
+ // create residency sets only on macOS >= 15.0
+ #if !TARGET_CPU_X86_64 && TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000 || \
+     TARGET_OS_IOS && __IPHONE_OS_VERSION_MAX_ALLOWED >= 180000 || \
+     TARGET_OS_TV && __TV_OS_VERSION_MAX_ALLOWED >= 180000 || \
+     TARGET_OS_VISION && __VISION_OS_VERSION_MAX_ALLOWED >= 200000
+ #define GGML_METAL_HAS_RESIDENCY_SETS 1
+ #endif
+ 
+@@ -76,16 +82,19 @@ void ggml_metal_cv_set_bool(ggml_metal_cv_t cv, bool value, int32_t idx) {
+ }
+ 
+ //
+ // MTLComputePipelineState wrapper
+ //
+ 
+ struct ggml_metal_pipeline {
+     id<MTLComputePipelineState> obj;
++#if GGML_METAL_TELEMETRY
++    uint64_t tele_name_hash;
++#endif
+ };
+ 
+ ggml_metal_pipeline_t ggml_metal_pipeline_init(void) {
+     ggml_metal_pipeline_t res = calloc(1, sizeof(struct ggml_metal_pipeline));
+ 
+     *res = (struct ggml_metal_pipeline) {
+         /*.obj  =*/ nil,
+     };
+@@ -790,31 +799,37 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
+ 
+             GGML_LOG_ERROR("%s: incompatible pipeline %s\n", __func__, name);
+ 
+             return res;
+         }
+ 
+         res.pipeline = ggml_metal_pipeline_init();
+         res.pipeline->obj = obj;
++#if GGML_METAL_TELEMETRY
++        res.pipeline->tele_name_hash = tosh_tele_name_register((const uint8_t *) name, (uint32_t) strlen(name));
++#endif
+ 
+         ggml_metal_pipelines_add(lib->pipelines, name, res.pipeline);
+     }
+ 
+     [lib->lock unlock];
+ 
+     return res;
+ }
+ 
+ //
+ // MTLComputeCommandEncoder wrapper
+ //
+ 
+ struct ggml_metal_encoder {
+     id<MTLComputeCommandEncoder> obj;
++#if GGML_METAL_TELEMETRY
++    uint64_t tele_name_hash; // FNV-1a of the current pipeline name, 0 = none
++#endif
+ };
+ 
+ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
+     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
+ 
+     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+ 
+     if (concurrent) {
+@@ -840,32 +855,41 @@ void ggml_metal_encoder_debug_group_push(ggml_metal_encoder_t encoder, const cha
+ }
+ 
+ void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder) {
+     [encoder->obj popDebugGroup];
+ }
+ 
+ void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline) {
+     [encoder->obj setComputePipelineState:pipeline.pipeline->obj];
++#if GGML_METAL_TELEMETRY
++    encoder->tele_name_hash = pipeline.pipeline ? pipeline.pipeline->tele_name_hash : 0;
++#endif
+ }
+ 
+ void ggml_metal_encoder_set_bytes(ggml_metal_encoder_t encoder, void * data, size_t size, int idx) {
+     [encoder->obj setBytes:data length:size atIndex:idx];
+ }
+ 
+ void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx) {
+     [encoder->obj setBuffer:buffer.metal offset:buffer.offs atIndex:idx];
+ }
+ 
+ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder, size_t size, int idx) {
+     [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
+ }
+ 
+ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
+     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
++#if GGML_METAL_TELEMETRY
++    const unsigned int tele_mode = TOSH_TELE_MODE();
++    if (tele_mode) {
++        tosh_tele_objc_dispatch(encoder->obj, encoder->tele_name_hash, tele_mode, tg0, tg1, tg2, tptg0, tptg1, tptg2);
++    }
++#endif
+ }
+ 
+ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
+     [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
+ }
+ 
+ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
+     [encoder->obj endEncoding];
+@@ -1223,16 +1247,19 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
+                     dev->mtl_device = ggml_metal_device_default_discrete();
+                 }
+                 [all release];
+             } else {
+                 dev->mtl_device = ggml_metal_device_default_discrete();
+             }
+ 
+             if (dev->mtl_device) {
++#if GGML_METAL_TELEMETRY
++                tosh_tele_objc_device_init(device, dev->mtl_device);
++#endif
+                 dev->mtl_queue = ggml_metal_new_queue(dev->mtl_device);
+                 if (dev->mtl_queue == nil) {
+                     GGML_LOG_ERROR("%s: error: failed to create command queue\n", __func__);
+                 }
+ 
+                 dev->stage_lock = [[NSRecursiveLock alloc] init];
+                 dev->wrap_lock  = [[NSLock alloc] init];
+ 
+@@ -1789,24 +1816,36 @@ struct ggml_metal_event {
+ };
+ 
+ void ggml_metal_event_encode_signal(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw) {
+     id<MTLSharedEvent> event = (id<MTLSharedEvent>)ev->obj;
+ 
+     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+ 
+     [cmd_buf encodeSignalEvent:event value:atomic_fetch_add_explicit(&ev->value, 1, memory_order_relaxed) + 1];
++#if GGML_METAL_TELEMETRY
++    if (TOSH_TELE_MODE()) {
++        tosh_tele_ev((uint32_t) tosh_tele_dev_index([cmd_buf device]), 0, 1,
++                     (uint64_t) atomic_load_explicit(&ev->value, memory_order_relaxed));
++    }
++#endif
+ }
+ 
+ void ggml_metal_event_encode_wait(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw) {
+     id<MTLSharedEvent> event = (id<MTLSharedEvent>)ev->obj;
+ 
+     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+ 
+     [cmd_buf encodeWaitForEvent:event value:atomic_load_explicit(&ev->value, memory_order_relaxed)];
++#if GGML_METAL_TELEMETRY
++    if (TOSH_TELE_MODE()) {
++        tosh_tele_ev((uint32_t) tosh_tele_dev_index([cmd_buf device]), 0, 0,
++                     (uint64_t) atomic_load_explicit(&ev->value, memory_order_relaxed));
++    }
++#endif
+ }
+ 
+ ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev) {
+     id<MTLSharedEvent> event = [dev->mtl_device newSharedEvent];
+ 
+     ggml_metal_event_t ev = calloc(1, sizeof(struct ggml_metal_event));
+ 
+     ev->obj = (__bridge void *)event;
+@@ -3516,16 +3555,21 @@ bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_dst, const struct ggml
+         if (bid_src.metal == nil || bid_dst.metal == nil) {
+             return false;
+         }
+ 
+         id<MTLCommandBuffer> cmd_buf = [buf_dst->dev->mtl_queue commandBufferWithUnretainedReferences];
+ 
+         {
+             id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
++#if GGML_METAL_TELEMETRY
++            if (TOSH_TELE_MODE()) {
++                tosh_tele_blit((uint32_t) tosh_tele_dev_index(buf_dst->dev->mtl_device), 7, (uint64_t) size, 0);
++            }
++#endif
+ 
+             [encoder copyFromBuffer:bid_src.metal
+                        sourceOffset:bid_src.offs
+                            toBuffer:bid_dst.metal
+                   destinationOffset:bid_dst.offs
+                                size:size];
+ 
+             [encoder endEncoding];
+diff --git a/ggml/src/ggml-metal/ggml-metal-telemetry.h b/ggml/src/ggml-metal/ggml-metal-telemetry.h
+new file mode 100644
+index 000000000..fc46014cd
+--- /dev/null
++++ b/ggml/src/ggml-metal/ggml-metal-telemetry.h
+@@ -0,0 +1,69 @@
++//
++// ggml-metal-telemetry.h — glue between ggml-metal and the tosh-telemetry
++// Rust staticlib (Phase-0 observability). Compiled only with
++// GGML_METAL_TELEMETRY; every call site degenerates to one load + one branch
++// on tosh_tele_g_mode when telemetry is built in but disabled via env.
++//
++
++#pragma once
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// -- direct Rust exports (libtosh_telemetry.a) ------------------------------
++
++// mode word: 0 = off, 1 = token mode, 2 = + per-dispatch metadata.
++// Set once by tosh_tele_init(); read on hot paths with a relaxed atomic load.
++extern _Atomic unsigned int tosh_tele_g_mode;
++
++void     tosh_tele_init(void);
++unsigned tosh_tele_mode(void);
++void     tosh_tele_flush(void);
++uint64_t tosh_tele_uptime_ns(void);
++
++uint64_t tosh_tele_graph_begin(uint32_t device, uint64_t n_nodes);
++void     tosh_tele_graph_end(uint32_t device, uint64_t ordinal, uint64_t n_nodes, uint32_t n_cb, uint32_t flags);
++uint64_t tosh_tele_current_graph(uint32_t device);
++
++void tosh_tele_cb_cpu(uint32_t device, uint64_t graph, uint32_t cb_idx, uint32_t n_cb,
++                      uint64_t t_begin_ns, uint64_t t_end_ns, uint64_t t_commit_ns);
++void tosh_tele_cb_gpu(uint32_t device, uint64_t graph, uint32_t cb_idx,
++                      uint64_t kernel_start_ns, uint64_t kernel_end_ns,
++                      uint64_t gpu_start_ns, uint64_t gpu_end_ns, uint64_t host_done_ns);
++
++uint64_t tosh_tele_name_register(const uint8_t * name, uint32_t name_len);
++void tosh_tele_dispatch(uint32_t device, uint64_t name_hash,
++                        uint64_t tg0, uint64_t tg1, uint64_t tg2,
++                        uint64_t tptg0, uint64_t tptg1, uint64_t tptg2);
++void tosh_tele_blit(uint32_t device, uint32_t kind, uint64_t nbytes, uint32_t dst_device);
++void tosh_tele_ev(uint32_t device, uint32_t kind, uint32_t is_signal, uint64_t value);
++
++void tosh_tele_set_devices_json(const char * json);
++void tosh_tele_manifest_set_field(const char * key, const char * json);
++
++// -- ObjC glue (implemented in ggml-metal-telemetry.m) -----------------------
++
++// map an id<MTLDevice> (as void*) to the ggml device slot it was registered with
++int  tosh_tele_dev_index(const void * mtl_device);
++
++// register a device slot and (once per process) hand the manifest the full
++// device inventory + build stamps; calls tosh_tele_init()
++void tosh_tele_objc_device_init(int slot, void * mtl_device);
++
++// push the CB_GPU record from the Metal completion handler; attach BEFORE
++// commit (macOS 26 asserts on handler registration after commit). The matching
++// CB_CPU record is pushed by the call site right after [cmd_buf commit].
++void tosh_tele_objc_cb_attach(void * cmd_buf, int device, int cb_idx);
++
++// count (mode 1) or record (mode 2) one compute dispatch; name_hash comes
++// from tosh_tele_name_register at pipeline creation (0 = count only)
++void tosh_tele_objc_dispatch(void * encoder, uint64_t name_hash, unsigned mode,
++                             long tg0, long tg1, long tg2,
++                             long tptg0, long tptg1, long tptg2);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ggml/src/ggml-metal/ggml-metal-telemetry.m b/ggml/src/ggml-metal/ggml-metal-telemetry.m
+new file mode 100644
+index 000000000..cc94d5862
+--- /dev/null
++++ b/ggml/src/ggml-metal/ggml-metal-telemetry.m
+@@ -0,0 +1,191 @@
++//
++// ggml-metal-telemetry.m — ObjC glue for the tosh-telemetry staticlib.
++// Added by patches/llama/metal/0055-telemetry.patch; compiled only with
++// GGML_METAL_TELEMETRY=ON and linked against libtosh_telemetry.a.
++//
++
++#import "ggml-metal-telemetry.h"
++
++#import <Foundation/Foundation.h>
++#import <Metal/Metal.h>
++
++#import <stdatomic.h>
++#import <stdlib.h>
++#import <string.h>
++#import <stdio.h>
++
++#define TT_STR2(x) #x
++#define TT_STR(x) TT_STR2(x)
++
++// ---------------------------------------------------------------------------
++// device registry: ggml slot <-> MTLDevice. Populated serially during backend
++// registration, then read lock-free on hot paths.
++
++static const void * s_dev_ptr[16];
++static uint64_t     s_dev_reg[16];
++static int          s_dev_slot[16];
++static int          s_dev_n = 0;
++
++int tosh_tele_dev_index(const void * mtl_device) {
++    for (int i = 0; i < s_dev_n; ++i) {
++        if (s_dev_ptr[i] == mtl_device) {
++            return s_dev_slot[i];
++        }
++    }
++    // slow fallback: match by registryID (covers re-fetched device objects)
++    const uint64_t reg = [(id<MTLDevice>) mtl_device registryID];
++    for (int i = 0; i < s_dev_n; ++i) {
++        if (s_dev_reg[i] == reg) {
++            return s_dev_slot[i];
++        }
++    }
++    return 0;
++}
++
++// ---------------------------------------------------------------------------
++// device init hook
++
++void tosh_tele_objc_device_init(int slot, void * mtl_device_raw) {
++    tosh_tele_init(); // idempotent; fixes the mode word
++
++    id<MTLDevice> mtl = (id<MTLDevice>) mtl_device_raw;
++
++    if (s_dev_n < 16) {
++        const uint64_t reg = mtl.registryID;
++        bool seen = false;
++        for (int i = 0; i < s_dev_n; ++i) {
++            if (s_dev_reg[i] == reg && s_dev_slot[i] == slot) {
++                seen = true;
++                break;
++            }
++        }
++        if (!seen) {
++            s_dev_ptr[s_dev_n]  = mtl_device_raw;
++            s_dev_reg[s_dev_n]  = reg;
++            s_dev_slot[s_dev_n] = slot;
++            s_dev_n++;
++        }
++    }
++
++    if (atomic_load_explicit(&tosh_tele_g_mode, memory_order_relaxed) == 0) {
++        return;
++    }
++
++    static bool s_manifest_done = false;
++    if (s_manifest_done) {
++        return;
++    }
++    s_manifest_done = true;
++
++    // full device inventory for the manifest
++    @autoreleasepool {
++        NSArray<id<MTLDevice>> * all = MTLCopyAllDevices();
++        NSMutableString * js = [NSMutableString stringWithString:@"["];
++        NSUInteger i = 0;
++        for (id<MTLDevice> d in all) {
++            int slot_of = -1;
++            for (int k = 0; k < s_dev_n; ++k) {
++                if (s_dev_reg[k] == d.registryID) {
++                    slot_of = s_dev_slot[k];
++                    break;
++                }
++            }
++            if (i++ > 0) {
++                [js appendString:@","];
++            }
++            [js appendFormat:@"{\"name\":\"%s\",\"registryID\":%llu,\"peerGroupID\":%llu,"
++                              "\"peerCount\":%llu,\"recommendedMaxWorkingSetSize\":%llu,"
++                              "\"hasUnifiedMemory\":%s,\"isLowPower\":%s,\"isRemovable\":%s,"
++                              "\"ggml_slot\":%d}",
++                [d.name UTF8String],
++                (unsigned long long) d.registryID,
++                (unsigned long long) d.peerGroupID,
++                (unsigned long long) d.peerCount,
++                (unsigned long long) d.recommendedMaxWorkingSetSize,
++                d.hasUnifiedMemory ? "true" : "false",
++                d.isLowPower ? "true" : "false",
++                d.removable ? "true" : "false",
++                slot_of];
++        }
++        [js appendString:@"]"];
++        tosh_tele_set_devices_json([js UTF8String]);
++        [all release];
++    }
++
++    // backend stamp: the core emits "backend":"unknown" unless glue overrides it
++    tosh_tele_manifest_set_field("backend", "\"metal\"");
++
++    // compile-time build stamps
++    {
++#ifdef TOSH_VERSION
++        const char * tosh_ver = TT_STR(TOSH_VERSION);
++#else
++        const char * tosh_ver = "unknown";
++#endif
++#ifdef TOSH_GIT_COMMIT
++        const char * tosh_commit = TT_STR(TOSH_GIT_COMMIT);
++#else
++        const char * tosh_commit = "unknown";
++#endif
++#ifdef TOSH_GIT_DIRTY
++        const char * tosh_dirty = TT_STR(TOSH_GIT_DIRTY);
++#else
++        const char * tosh_dirty = "0";
++#endif
++#ifdef TOSH_LLAMA_COMMIT
++        const char * llama_commit = TT_STR(TOSH_LLAMA_COMMIT);
++#else
++        const char * llama_commit = "unknown";
++#endif
++        char buf[1024];
++        snprintf(buf, sizeof(buf),
++            "{\"clang\":\"%s\",\"sdk_max\":\"0x%x\",\"deployment_min\":\"0x%x\",\"tosh_version\":\"%s\","
++            "\"toshllm_commit\":\"%s\",\"toshllm_dirty\":%s,\"llama_commit\":\"%s\"}",
++            __clang_version__,
++            (unsigned) __MAC_OS_X_VERSION_MAX_ALLOWED,
++            (unsigned) __MAC_OS_X_VERSION_MIN_REQUIRED,
++            tosh_ver, tosh_commit, tosh_dirty, llama_commit);
++        tosh_tele_manifest_set_field("build", buf);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// command-buffer records
++
++void tosh_tele_objc_cb_attach(void * cmd_buf_raw, int device, int cb_idx) {
++    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
++    const uint64_t graph = tosh_tele_current_graph((uint32_t) device);
++
++    // One handler only: kernelStartTime/kernelEndTime are fixed once the CB is
++    // scheduled, so they are safe to read at completion time. This avoids the
++    // scheduled handler's block copy plus the calloc/free stash pair that used
++    // to ferry the two timestamps between handlers. Must still be attached
++    // BEFORE commit (handler registration after commit asserts on macOS 26).
++    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
++        tosh_tele_cb_gpu((uint32_t) device, graph, (uint32_t) cb_idx,
++                         (uint64_t) (cb.kernelStartTime * 1e9),
++                         (uint64_t) (cb.kernelEndTime   * 1e9),
++                         (uint64_t) (cb.GPUStartTime    * 1e9),
++                         (uint64_t) (cb.GPUEndTime      * 1e9),
++                         tosh_tele_uptime_ns());
++    }];
++}
++
++// ---------------------------------------------------------------------------
++// dispatch hook
++
++void tosh_tele_objc_dispatch(void * encoder_raw, uint64_t name_hash, unsigned mode,
++                             long tg0, long tg1, long tg2,
++                             long tptg0, long tptg1, long tptg2) {
++    id<MTLComputeCommandEncoder> enc = (id<MTLComputeCommandEncoder>) encoder_raw;
++    const int dev = tosh_tele_dev_index(enc.device);
++
++    if (mode < 2) {
++        tosh_tele_dispatch((uint32_t) dev, 0, 0, 0, 0, 0, 0, 0);
++        return;
++    }
++
++    tosh_tele_dispatch((uint32_t) dev, name_hash,
++                       (uint64_t) tg0, (uint64_t) tg1, (uint64_t) tg2,
++                       (uint64_t) tptg0, (uint64_t) tptg1, (uint64_t) tptg2);
++}

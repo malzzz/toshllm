@@ -1,0 +1,741 @@
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index d3953eee9..71bf93e43 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -259,11 +259,24 @@ if (CUDAToolkit_FOUND)
+ 
+     list(JOIN   CUDA_CXX_FLAGS " " CUDA_CXX_FLAGS_JOINED)  # pass host compiler flags as a single argument
+ 
+     if (NOT CUDA_CXX_FLAGS_JOINED STREQUAL "")
+         list(APPEND CUDA_FLAGS -Xcompiler ${CUDA_CXX_FLAGS_JOINED})
+     endif()
+ 
+     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
++
++    # ToshLLM Phase-3 telemetry (CUDA twin of metal patch 0055): C++ glue + the
++    # tosh-telemetry Rust staticlib. Inert at runtime unless TOSH_TELEMETRY=1|2.
++    option(GGML_CUDA_TELEMETRY "ggml-cuda: tosh-telemetry instrumentation" OFF)
++    if (GGML_CUDA_TELEMETRY)
++        if (NOT TOSH_TELEMETRY_STATICLIB)
++            message(FATAL_ERROR "GGML_CUDA_TELEMETRY=ON requires -DTOSH_TELEMETRY_STATICLIB=/path/to/libmxp_telemetry.a")
++        endif()
++        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_TELEMETRY)
++        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_TELEMETRY_NVCC_VERSION="${CMAKE_CUDA_COMPILER_VERSION}")
++        target_sources(ggml-cuda PRIVATE ggml-cuda-telemetry.cpp)
++        target_link_libraries(ggml-cuda PRIVATE ${TOSH_TELEMETRY_STATICLIB})
++    endif()
+ else()
+     message(FATAL_ERROR "CUDA Toolkit not found")
+ endif()
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-telemetry.cpp b/ggml/src/ggml-cuda/ggml-cuda-telemetry.cpp
+new file mode 100644
+index 000000000..7ed8f4b78
+--- /dev/null
++++ b/ggml/src/ggml-cuda/ggml-cuda-telemetry.cpp
+@@ -0,0 +1,255 @@
++//
++// ggml-cuda-telemetry.cpp — C++ glue for the tosh-telemetry staticlib.
++// CUDA twin of ggml-metal-telemetry.m; compiled only with
++// GGML_CUDA_TELEMETRY=ON and linked against libmxp_telemetry.a.
++// Runtime-API only (no device code), so this builds as plain C++.
++
++#include "ggml-cuda-telemetry.h"
++
++#include <cuda_runtime.h>
++
++#include <mutex>
++#include <stdio.h>
++#include <string>
++#include <string.h>
++
++#define TT_STR2(x) #x
++#define TT_STR(x) TT_STR2(x)
++
++// ---------------------------------------------------------------------------
++// device registry: ggml slot -> physical CUDA ordinal. Populated serially
++// during backend registration (ggml_backend_cuda_reg), then read-only.
++
++#define TT_MAX_DEV 16
++
++static int s_phys[TT_MAX_DEV];
++static int s_dev_n = 0;
++
++void tosh_tele_cuda_device_init(int slot, int physical_cuda_device) {
++    tosh_tele_init(); // idempotent; fixes the mode word
++
++    if (slot >= 0 && slot < TT_MAX_DEV) {
++        s_phys[slot] = physical_cuda_device;
++        if (slot + 1 > s_dev_n) {
++            s_dev_n = slot + 1;
++        }
++    }
++
++    if (__atomic_load_n(&tosh_tele_g_mode, __ATOMIC_RELAXED) == 0) {
++        return;
++    }
++
++    static bool s_manifest_done = false;
++    if (s_manifest_done) {
++        return;
++    }
++    s_manifest_done = true;
++
++    // full physical device inventory for the manifest
++    {
++        int n = 0;
++        if (cudaGetDeviceCount(&n) != cudaSuccess) {
++            n = 0;
++        }
++        std::string js = "[";
++        for (int i = 0; i < n; ++i) {
++            cudaDeviceProp prop;
++            if (cudaGetDeviceProperties(&prop, i) != cudaSuccess) {
++                continue;
++            }
++            char pci[64] = {};
++            cudaDeviceGetPCIBusId(pci, sizeof(pci), i);
++            int slot_of = -1;
++            for (int k = 0; k < s_dev_n; ++k) {
++                if (s_phys[k] == i) {
++                    slot_of = k;
++                    break;
++                }
++            }
++            char ent[1024];
++            snprintf(ent, sizeof(ent),
++                "%s{\"name\":\"%s\",\"pci_bus_id\":\"%s\",\"compute_capability\":\"%d.%d\","
++                "\"total_mem\":%llu,\"sm_count\":%d,\"ggml_slot\":%d}",
++                i > 0 ? "," : "", prop.name, pci, prop.major, prop.minor,
++                (unsigned long long) prop.totalGlobalMem, prop.multiProcessorCount, slot_of);
++            js += ent;
++        }
++        js += "]";
++        tosh_tele_set_devices_json(js.c_str());
++    }
++
++    // backend stamp: the core emits "backend":"unknown" unless glue overrides it
++    tosh_tele_manifest_set_field("backend", "\"cuda\"");
++
++    // build stamps
++    {
++#ifdef GGML_CUDA_TELEMETRY_NVCC_VERSION
++        const char * nvcc_ver = GGML_CUDA_TELEMETRY_NVCC_VERSION;
++#else
++        const char * nvcc_ver = "unknown";
++#endif
++#ifdef TOSH_VERSION
++        const char * tosh_ver = TT_STR(TOSH_VERSION);
++#else
++        const char * tosh_ver = "unknown";
++#endif
++#ifdef TOSH_GIT_COMMIT
++        const char * tosh_commit = TT_STR(TOSH_GIT_COMMIT);
++#else
++        const char * tosh_commit = "unknown";
++#endif
++#ifdef TOSH_GIT_DIRTY
++        const char * tosh_dirty = TT_STR(TOSH_GIT_DIRTY);
++#else
++        const char * tosh_dirty = "0";
++#endif
++#ifdef TOSH_LLAMA_COMMIT
++        const char * llama_commit = TT_STR(TOSH_LLAMA_COMMIT);
++#else
++        const char * llama_commit = "unknown";
++#endif
++        int rt = 0;
++        cudaRuntimeGetVersion(&rt);
++        char buf[1024];
++        snprintf(buf, sizeof(buf),
++            "{\"cudart_compile\":%d,\"cudart_runtime\":%d,\"nvcc\":\"%s\",\"tosh_version\":\"%s\","
++            "\"toshllm_commit\":\"%s\",\"toshllm_dirty\":%s,\"llama_commit\":\"%s\"}",
++            (int) CUDART_VERSION, rt, nvcc_ver, tosh_ver, tosh_commit, tosh_dirty, llama_commit);
++        tosh_tele_manifest_set_field("build", buf);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// command-buffer GPU timing: per-device pool of preallocated cudaEvent pairs.
++// cb_begin records ev0 on the launch stream (host anchor sampled just before),
++// cb_end records ev1, resolve converts the elapsed time to host-anchored
++// gpu_start/gpu_end once the stream has passed ev1. See the header for why
++// this approximates (not equals) Metal's absolute GPU timestamps.
++
++#define TT_POOL 32
++
++struct tt_cb {
++    cudaEvent_t  ev0;       // begin (timing enabled); NULL until first use
++    cudaEvent_t  ev1;       // end
++    cudaStream_t stream;
++    uint64_t     graph;
++    uint32_t     cb_idx;
++    uint64_t     anchor_ns; // host ns sampled just before the ev0 record
++    int          state;     // 0 = free, 1 = claimed (awaiting cb_end), 2 = pending resolve
++};
++
++static tt_cb       s_pool[TT_MAX_DEV][TT_POOL];
++static std::mutex  s_pool_mu;
++
++// caller holds s_pool_mu
++static void resolve_locked(int device) {
++    for (int i = 0; i < TT_POOL; ++i) {
++        tt_cb & s = s_pool[device][i];
++        if (s.state != 2) {
++            continue;
++        }
++        if (cudaEventQuery(s.ev1) != cudaSuccess) {
++            continue; // stream has not passed the end record yet
++        }
++        float ms = 0.0f;
++        const bool ok = cudaEventElapsedTime(&ms, s.ev0, s.ev1) == cudaSuccess;
++        // kernel timestamps unavailable (flags bit0); gpu ts zeroed on error (bit1)
++        const uint64_t gpu_start = ok ? s.anchor_ns : 0;
++        const uint64_t gpu_end   = ok ? s.anchor_ns + (uint64_t) (ms * 1e6) : 0;
++        tosh_tele_cb_gpu((uint32_t) device, s.graph, s.cb_idx,
++                         0, 0, gpu_start, gpu_end, tosh_tele_uptime_ns());
++        s.state = 0;
++    }
++}
++
++uint64_t tosh_tele_cuda_cb_begin(int device, void * stream, uint64_t graph, uint32_t cb_idx) {
++    if (device < 0 || device >= TT_MAX_DEV) {
++        return 0;
++    }
++    std::lock_guard<std::mutex> lock(s_pool_mu);
++    resolve_locked(device); // recycle completed pairs before claiming a slot
++    for (int i = 0; i < TT_POOL; ++i) {
++        tt_cb & s = s_pool[device][i];
++        if (s.state != 0) {
++            continue;
++        }
++        if (s.ev0 == nullptr) {
++            if (cudaEventCreate(&s.ev0) != cudaSuccess || cudaEventCreate(&s.ev1) != cudaSuccess) {
++                return 0;
++            }
++        }
++        s.stream    = (cudaStream_t) stream;
++        s.graph     = graph;
++        s.cb_idx    = cb_idx;
++        s.anchor_ns = tosh_tele_uptime_ns();
++        if (cudaEventRecord(s.ev0, s.stream) != cudaSuccess) {
++            return 0;
++        }
++        s.state = 1;
++        return ((uint64_t) (uint32_t) device << 32) | (uint32_t) (i + 1);
++    }
++    return 0; // pool exhausted: cb_gpu dropped for this CB
++}
++
++void tosh_tele_cuda_cb_end(uint64_t ticket) {
++    if (ticket == 0) {
++        return;
++    }
++    const int device = (int) (ticket >> 32);
++    const int idx    = (int) (ticket & 0xffffffffu) - 1;
++    std::lock_guard<std::mutex> lock(s_pool_mu);
++    tt_cb & s = s_pool[device][idx];
++    if (s.state != 1) {
++        return;
++    }
++    if (cudaEventRecord(s.ev1, s.stream) != cudaSuccess) {
++        s.state = 0;
++        return;
++    }
++    s.state = 2;
++}
++
++void tosh_tele_cuda_cb_resolve(int device) {
++    if (device < 0 || device >= TT_MAX_DEV) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(s_pool_mu);
++    resolve_locked(device);
++}
++
++// ---------------------------------------------------------------------------
++// dispatch hook: per-node, op-name hash cached after first registration.
++// Grid/block dims are unavailable at this granularity (see header).
++
++#define TT_MAX_NAMES 256
++
++struct tt_name {
++    const char * name; // ggml_op_name strings are static
++    uint64_t     hash;
++};
++
++static tt_name    s_names[TT_MAX_NAMES];
++static int        s_names_n = 0;
++static std::mutex s_names_mu;
++
++void tosh_tele_cuda_dispatch(int device, const char * op_name, unsigned mode) {
++    if (mode < 2) {
++        tosh_tele_dispatch((uint32_t) device, 0, 0, 0, 0, 0, 0, 0);
++        return;
++    }
++    uint64_t h = 0;
++    {
++        std::lock_guard<std::mutex> lock(s_names_mu);
++        for (int i = 0; i < s_names_n; ++i) {
++            if (strcmp(s_names[i].name, op_name) == 0) {
++                h = s_names[i].hash;
++                break;
++            }
++        }
++        if (h == 0 && s_names_n < TT_MAX_NAMES) {
++            h = tosh_tele_name_register((const uint8_t *) op_name, (uint32_t) strlen(op_name));
++            s_names[s_names_n++] = { op_name, h };
++        }
++    }
++    tosh_tele_dispatch((uint32_t) device, h, 0, 0, 0, 0, 0, 0);
++}
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-telemetry.h b/ggml/src/ggml-cuda/ggml-cuda-telemetry.h
+new file mode 100644
+index 000000000..72cb7365f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/ggml-cuda-telemetry.h
+@@ -0,0 +1,111 @@
++//
++// ggml-cuda-telemetry.h — glue between ggml-cuda and the tosh-telemetry
++// Rust staticlib (Phase-3; CUDA twin of ggml-metal-telemetry.h). Compiled
++// only with GGML_CUDA_TELEMETRY; every call site degenerates to one load +
++// one branch on tosh_tele_g_mode when telemetry is built in but disabled
++// via env.
++//
++// CUDA analogs of the Metal hook semantics (llama.cpp pin 3dc7285b):
++//
++// - "Command buffer" = one graph's batch of kernel launches on the backend's
++//   main stream (ggml_backend_cuda_graph_compute emits exactly one CB per
++//   graph, n_cb = 1). cb_cpu carries host t_begin/t_end/t_commit around the
++//   launch batch, same as Metal.
++// - cb_gpu: the batch is bracketed by a pair of cudaEvents (from a
++//   preallocated per-device pool — no cudaEventCreate on the hot path)
++//   recorded on the same stream, resolved after the backend's synchronize
++//   (or opportunistically on the next cb_begin). CUDA events yield only the
++//   elapsed time between the two records, so gpu_start/gpu_end are that
++//   delta anchored to the host clock (CLOCK_MONOTONIC_RAW ns) sampled just
++//   before the begin-record — an approximation of Metal's absolute
++//   GPUStartTime/EndTime. kernel_start/kernel_end are emitted as 0 (core
++//   sets flags bit0): per-dispatch GPU time is unavailable without CUPTI
++//   (future work).
++// - dispatch: ggml-cuda has no single kernel-launch choke point (each op
++//   launches via <<<>>> in its own .cu file), so the hook sits at the
++//   per-node dispatch site (ggml_cuda_compute_forward) and records the FNV-1a
++//   hash of the ggml op name. Grid/block dims are emitted as 0 — unavailable
++//   at node granularity (CUPTI, future).
++// - blit kinds (same numbering as the Metal patch):
++//     1 set_tensor       buffer + backend set_tensor(2d)(async) H2D copies
++//     2 get_tensor       buffer + backend get_tensor(2d)(async) D2H copies
++//     3 cpy_same_dev     backend cpy_tensor_async, same-backend D2D
++//     4 cpy_xdev_peer    backend cpy_tensor_async, cross-backend copy
++//                        (paired with EV kind 1 signal/wait on copy_event)
++//     5 cpy_xdev_events  NO CUDA ANALOG at this pin — the single xdev path
++//                        above already covers it; kind never emitted
++//     6 stage_set        Metal-specific staging fast path; no analog, omitted
++//     7 buffer_cpy_tensor buffer-iface cpy_tensor (same-physical D2D and
++//                        cudaMemcpyPeerAsync branches both land here)
++//   For kinds 4 and 7, p1 carries the peer ggml device slot (Metal passed 0).
++// - events: kind 0 = ggml backend event iface (event_record/event_wait),
++//   kind 1 = xdev_link (copy_event record/wait in cpy_tensor_async).
++//   cudaEvents carry no sequence value, so the event value is always 0.
++//   Kind 2 (peer_wait, Metal encodeWaitForEvent loop) has no analog, omitted.
++// - device registry: ggml device slot == the (virtual) CUDA device ordinal,
++//   so no pointer map is needed; the manifest maps slots to physical GPUs.
++
++#pragma once
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// -- direct Rust exports (libmxp_telemetry.a) ------------------------------
++
++// mode word: 0 = off, 1 = token mode, 2 = + per-dispatch metadata.
++// Set once by tosh_tele_init(); read on hot paths with __atomic_load_n
++// (declared as a plain word here; the core side is _Atomic, same ABI).
++extern unsigned int tosh_tele_g_mode;
++
++void     tosh_tele_init(void);
++unsigned tosh_tele_mode(void);
++void     tosh_tele_flush(void);
++uint64_t tosh_tele_uptime_ns(void);
++
++uint64_t tosh_tele_graph_begin(uint32_t device, uint64_t n_nodes);
++void     tosh_tele_graph_end(uint32_t device, uint64_t ordinal, uint64_t n_nodes, uint32_t n_cb, uint32_t flags);
++uint64_t tosh_tele_current_graph(uint32_t device);
++
++void tosh_tele_cb_cpu(uint32_t device, uint64_t graph, uint32_t cb_idx, uint32_t n_cb,
++                      uint64_t t_begin_ns, uint64_t t_end_ns, uint64_t t_commit_ns);
++void tosh_tele_cb_gpu(uint32_t device, uint64_t graph, uint32_t cb_idx,
++                      uint64_t kernel_start_ns, uint64_t kernel_end_ns,
++                      uint64_t gpu_start_ns, uint64_t gpu_end_ns, uint64_t host_done_ns);
++
++uint64_t tosh_tele_name_register(const uint8_t * name, uint32_t name_len);
++void tosh_tele_dispatch(uint32_t device, uint64_t name_hash,
++                        uint64_t tg0, uint64_t tg1, uint64_t tg2,
++                        uint64_t tptg0, uint64_t tptg1, uint64_t tptg2);
++void tosh_tele_blit(uint32_t device, uint32_t kind, uint64_t nbytes, uint32_t dst_device);
++void tosh_tele_ev(uint32_t device, uint32_t kind, uint32_t is_signal, uint64_t value);
++
++void tosh_tele_set_devices_json(const char * json);
++void tosh_tele_manifest_set_field(const char * key, const char * json);
++
++// -- CUDA glue (implemented in ggml-cuda-telemetry.cpp) ---------------------
++
++// register a ggml device slot and (once per process) hand the manifest the
++// full device inventory + build stamps; calls tosh_tele_init()
++void tosh_tele_cuda_device_init(int slot, int physical_cuda_device);
++
++// bracket one launch batch (one "command buffer") on a stream with a timing
++// event pair from the per-device pool. cb_begin records the begin event and
++// returns a ticket (0 = pool exhausted, cb_gpu dropped for this CB); cb_end
++// records the end event and queues the pair for resolution.
++uint64_t tosh_tele_cuda_cb_begin(int device, void * stream, uint64_t graph, uint32_t cb_idx);
++void     tosh_tele_cuda_cb_end(uint64_t ticket);
++
++// drain completed event pairs for a device, emitting tosh_tele_cb_gpu.
++// Called from the backend synchronize hook (and internally from cb_begin).
++void tosh_tele_cuda_cb_resolve(int device);
++
++// count (mode 1) or record (mode 2) one node dispatch; op_name is registered
++// once via tosh_tele_name_register (cached here)
++void tosh_tele_cuda_dispatch(int device, const char * op_name, unsigned mode);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 2456f7dcc..0651ce659 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -65,16 +65,33 @@
+ #include "ggml-cuda/pad_reflect_1d.cuh"
+ #include "ggml-cuda/solve_tri.cuh"
+ #include "ggml-cuda/tri.cuh"
+ #include "ggml-cuda/cumsum.cuh"
+ #include "ggml-cuda/fill.cuh"
+ #include "ggml-cuda/lightning-indexer.cuh"
+ #include "ggml.h"
+ 
++#if GGML_CUDA_TELEMETRY
++#include "ggml-cuda-telemetry.h"
++
++// one relaxed load + one branch per site when telemetry is built in but off
++#define TOSH_TELE_MODE() __atomic_load_n(&tosh_tele_g_mode, __ATOMIC_RELAXED)
++#define TOSH_TELE_BLIT(dev, kind, nbytes, dst) do { \
++    if (TOSH_TELE_MODE()) { \
++        tosh_tele_blit((uint32_t)(dev), (uint32_t)(kind), (uint64_t)(nbytes), (uint32_t)(dst)); \
++    } \
++} while (0)
++#define TOSH_TELE_EV(dev, kind, sig, val) do { \
++    if (TOSH_TELE_MODE()) { \
++        tosh_tele_ev((uint32_t)(dev), (uint32_t)(kind), (uint32_t)(sig), (uint64_t)(val)); \
++    } \
++} while (0)
++#endif
++
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
+ #include <charconv>
+ #include <cinttypes>
+ #include <condition_variable>
+ #include <cstddef>
+ #include <cstdint>
+@@ -782,52 +799,67 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+ 
+ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++#if GGML_CUDA_TELEMETRY
++    TOSH_TELE_BLIT(ctx->device, 1, size, 0);
++#endif
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+ 
+ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++#if GGML_CUDA_TELEMETRY
++    TOSH_TELE_BLIT(ctx->device, 2, size, 0);
++#endif
+     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+ 
+ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
+         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++#if GGML_CUDA_TELEMETRY
++    TOSH_TELE_BLIT(ctx->device, 1, size * n_copies, 0);
++#endif
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+ 
+ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
+         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++#if GGML_CUDA_TELEMETRY
++    TOSH_TELE_BLIT(ctx->device, 2, size * n_copies, 0);
++#endif
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+ }
+ 
+ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+     if (ggml_backend_buffer_is_cuda(src->buffer)) {
+         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
+         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
++#if GGML_CUDA_TELEMETRY
++        TOSH_TELE_BLIT(dst_ctx->device, 7, ggml_nbytes(src), src_ctx->device);
++#endif
+         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
+         // in which case a same-device copy (not a peer copy) is required
+         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
+         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
+         if (src_physical == dst_physical) {
+             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+         } else {
+ #ifdef GGML_CUDA_NO_PEER_COPY
+@@ -2433,46 +2465,58 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
+ }
+ 
+ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++#if GGML_CUDA_TELEMETRY
++    TOSH_TELE_BLIT(cuda_ctx->device, 1, size, 0);
++#endif
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+ }
+ 
+ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++#if GGML_CUDA_TELEMETRY
++    TOSH_TELE_BLIT(cuda_ctx->device, 2, size, 0);
++#endif
+     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+ }
+ 
+ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
+         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++#if GGML_CUDA_TELEMETRY
++    TOSH_TELE_BLIT(cuda_ctx->device, 1, size * n_copies, 0);
++#endif
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+ }
+ 
+ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data,
+         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++#if GGML_CUDA_TELEMETRY
++    TOSH_TELE_BLIT(cuda_ctx->device, 2, size * n_copies, 0);
++#endif
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+ }
+ 
+ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+ 
+@@ -2509,38 +2553,56 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+         } else {
+ #ifdef GGML_CUDA_NO_PEER_COPY
+             return false;
+ #else
+             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
+ #endif // GGML_CUDA_NO_PEER_COPY
+         }
+ 
++#if GGML_CUDA_TELEMETRY
++        TOSH_TELE_BLIT(cuda_ctx_src->device, 4, ggml_nbytes(dst), cuda_ctx_dst->device);
++#endif
+         // record event on src stream after the copy
+         if (!cuda_ctx_src->copy_event) {
+             ggml_cuda_set_device(cuda_ctx_src->device);
+             CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
+         }
+ 
+         CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
++#if GGML_CUDA_TELEMETRY
++        TOSH_TELE_EV(cuda_ctx_src->device, 1, 1, 0);
++#endif
+ 
+         // wait on dst stream for the copy to complete
+         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
++#if GGML_CUDA_TELEMETRY
++        TOSH_TELE_EV(cuda_ctx_dst->device, 1, 0, 0);
++#endif
+     } else {
+         // src and dst are on the same backend
++#if GGML_CUDA_TELEMETRY
++        TOSH_TELE_BLIT(cuda_ctx_src->device, 3, ggml_nbytes(dst), 0);
++#endif
+         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+     }
+     return true;
+ }
+ 
+ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+ 
+     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+ 
++#if GGML_CUDA_TELEMETRY
++    if (TOSH_TELE_MODE()) {
++        tosh_tele_cuda_cb_resolve(cuda_ctx->device);
++    }
++#endif
++
+     GGML_UNUSED(backend);
+ }
+ 
+ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
+     return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
+            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
+ }
+ 
+@@ -4173,16 +4235,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                                (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
+                     }
+                 }
+ #else
+                 GGML_UNUSED(integrated);
+ #endif  // NDEBUG
+ 
++#if GGML_CUDA_TELEMETRY
++                const unsigned int tele_mode = TOSH_TELE_MODE();
++                if (tele_mode) {
++                    tosh_tele_cuda_dispatch(cuda_ctx->device, ggml_op_name(node->op), tele_mode);
++                }
++#endif
+                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                 if (!ok) {
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                 }
+                 GGML_ASSERT(ok);
+ 
+                 if (!is_concurrent_event_active) {
+                     try_launch_concurrent_event(node);
+@@ -4244,16 +4312,23 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+ }
+ #endif // USE_CUDA_GRAPH
+ 
+ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
++#if GGML_CUDA_TELEMETRY
++    const unsigned int tele_mode = TOSH_TELE_MODE();
++    const uint64_t tele_graph = tele_mode ? tosh_tele_graph_begin((uint32_t) cuda_ctx->device, (uint64_t) cgraph->n_nodes) : 0;
++    const uint64_t tele_t0    = tele_mode ? tosh_tele_uptime_ns() : 0;
++    const uint64_t tele_cb    = tele_mode ? tosh_tele_cuda_cb_begin(cuda_ctx->device, (void *) cuda_ctx->stream(), tele_graph, 0) : 0;
++#endif
++
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+     const void * graph_key = nullptr;
+ 
+ #ifdef USE_CUDA_GRAPH
+     graph_key = ggml_cuda_graph_get_key(cgraph);
+ 
+     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+@@ -4295,30 +4370,44 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+             ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+         }
+ 
+         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+     }
+ 
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+ 
++#if GGML_CUDA_TELEMETRY
++    if (tele_mode) {
++        const uint64_t tele_t1 = tosh_tele_uptime_ns();
++        tosh_tele_cuda_cb_end(tele_cb);
++        tosh_tele_cb_cpu((uint32_t) cuda_ctx->device, tele_graph, 0, 1, tele_t0, tele_t1, tosh_tele_uptime_ns());
++        tosh_tele_graph_end((uint32_t) cuda_ctx->device, tele_graph, (uint64_t) cgraph->n_nodes, 1, 0);
++    }
++#endif
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+ static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+ 
+     CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
++#if GGML_CUDA_TELEMETRY
++    TOSH_TELE_EV(cuda_ctx->device, 0, 1, 0); // cudaEvents carry no sequence value
++#endif
+ }
+ 
+ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+ 
+     if (ggml_backend_is_cuda(backend)) {
+         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0));
++#if GGML_CUDA_TELEMETRY
++        TOSH_TELE_EV(cuda_ctx->device, 0, 0, 0);
++#endif
+     } else {
+ #if 0
+         // untested
+         auto wait_fn = [](void * user_data) {
+             ggml_backend_event_t event = (ggml_backend_event_t)user_data;
+             ggml_backend_event_synchronize(event);
+         };
+ 
+@@ -5530,16 +5619,19 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
+                 dev_ctx->pci_bus_id = pci_bus_id;
+                 if (virtual_devices) {
+                     // make the pci bus id unique for virtual devices
+                     dev_ctx->pci_bus_id += "-v" + std::to_string(i);
+                 }
+                 for (char & c : dev_ctx->pci_bus_id) {
+                     c = std::tolower(c);
+                 }
++#if GGML_CUDA_TELEMETRY
++                tosh_tele_cuda_device_init(i, physical_id);
++#endif
+                 dev_ctx->op_offload_min_batch_size = min_batch_size;
+ 
+                 ggml_backend_dev_t dev = new ggml_backend_device {
+                     /* .iface   = */ ggml_backend_cuda_device_interface,
+                     /* .reg     = */ &reg,
+                     /* .context = */ dev_ctx
+                 };
+                 ctx->devices.push_back(dev);
