@@ -1,0 +1,71 @@
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 66e107d6b..a9b5c3675 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1,17 +1,21 @@
+ #include "ggml.h"
+ #include "ggml-impl.h"
+ #include "ggml-backend.h"
+ #include "ggml-backend-impl.h"
+ #include "ggml-alloc.h"
+ #include "ggml-cpp.h"
+ 
+ #include <atomic>
++#ifdef __APPLE__
+ #include <dispatch/dispatch.h>
++#else
++#include <thread>
++#endif
+ #include <algorithm>
+ #include <cassert>
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
+ #include <map>
+ #include <memory>
+@@ -2584,23 +2588,44 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+         const char * s_se = getenv("TOSH_MGPU_SERIAL_ENCODE");
+         serial_encode = s_se ? atoi(s_se) : 0;
+     }
+ 
+     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+         if (!serial_encode && n_backends > 1) {
+             std::atomic<int> failed{(int) GGML_STATUS_SUCCESS};
+             std::atomic<int> * p_failed = &failed;
++#ifdef __APPLE__
+             dispatch_apply(n_backends, DISPATCH_APPLY_AUTO, ^(size_t j) {
+                 auto & bcj = backend_ctx->backend_configs[j];
+                 const ggml_status st = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+                 if (st != GGML_STATUS_SUCCESS) {
+                     p_failed->store((int) st);
+                 }
+             });
++#else
++            // Portable twin of the GCD dispatch: one std::thread per backend enqueues its
++            // subgraph, joined before the AllReduce below. Same semantics, no libdispatch.
++            {
++                std::vector<std::thread> workers;
++                workers.reserve(n_backends);
++                for (size_t j = 0; j < n_backends; j++) {
++                    workers.emplace_back([&, j]() {
++                        auto & bcj = backend_ctx->backend_configs[j];
++                        const ggml_status st = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
++                        if (st != GGML_STATUS_SUCCESS) {
++                            p_failed->store((int) st);
++                        }
++                    });
++                }
++                for (auto & w : workers) {
++                    w.join();
++                }
++            }
++#endif
+             if (failed.load() != (int) GGML_STATUS_SUCCESS) {
+                 return (ggml_status) failed.load();
+             }
+         } else
+         for (size_t j = 0; j < n_backends; j++) {
+             auto & bcj = backend_ctx->backend_configs[j];
+             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+             if (status != GGML_STATUS_SUCCESS) {

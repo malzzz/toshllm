@@ -69,6 +69,25 @@ below):
   the vec/tile pipeline lookups (miss falls through to the generic kernels).
   Validated on gfx906: pre-fix exit 139 repro, post-fix the configs skip to
   CPU; full FA suite otherwise unchanged. Upstream PR candidate.
+- `0056-qwen4exp-mtp.patch` — MTP/NextN draft-head support for qwen4exp
+  (Qwen3.8-Flash-Next): five `blk.N.nextn.*` tensor types (fc_embedding,
+  fc_hidden, hc_mix_norm/down/up), mtp_only/load_mtp wiring in
+  `qwen4exp.cpp::load_arch_tensors`, conditional last-layer row drop +
+  wide pre-final-mixer `t_h_nextn` on the target graph (the staging
+  plumbing was already n_embd_out-wide), dense `graph_mtp` (no QSA indexer
+  — the GLM_DSA/DEEPSEEK32 draft precedent), `hc_combine` null-inject
+  unit-weight path, QWEN4EXP added to the `mtp_on_hybrid` memory branch
+  (draft ctx = plain KV cache over the nextn layer only), converter MTP
+  export + gguf-py tensor map entries. Semantics pinned from vLLM
+  `qwen4_exp/nvidia/mtp.py` (only public MTP implementation; HF transformers
+  ignores ^mtp.*). Measured on the rig with a hand-built mtp-only draft
+  GGUF (MXP `scripts/make-qwen4exp-mtp-gguf.py`): engages, 54.2% acceptance,
+  correct output. Upstream PR candidate (large; coordinate with maintainer).
+- `0057-linux-meta-threads.patch` — ggml-backend-meta: std::thread twin of
+  the Apple GCD multi-backend subgraph dispatch. Captures a long-standing
+  in-tree edit from the Linux bring-up that was never in the series (the
+  v0.87 round-trip diff caught it). FORK-LOCAL: Linux-only, upstream is
+  macOS+AMD.
 
 Dropped across the v0.86/v0.86.1/v0.87 syncs:
 
