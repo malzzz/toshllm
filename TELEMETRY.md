@@ -58,6 +58,17 @@ below):
   the MoE compact-assemble path in v0.86.3+ without an OFF stub; breaks
   `TOSH_ENABLE_DYNAMIC_MOE=OFF` builds. Same class as the old 0078/0081 —
   upstream PR candidate.
+- `0055-metal-fa-dk384-640-guard.patch` — `supports_op` and the FA dispatch
+  name list admitted dk 384/640 for non-Turbo K/V, but the .metal side
+  instantiates the standard pairs only at dk 64/128/256/512 (384/640 are
+  Turbo-only): the pipeline miss left a null pipeline that the max-threads
+  guard dereferenced — SIGSEGV on AMD. Gates 384/640 to Turbo KV in the AMD
+  branch, rejects dk 384/640 in the generic tail too (the 0002 head-size
+  widening had also opened the generic Apple-Silicon path, which likewise
+  lacks the instantiation — upstream never admits 384/640), and null-guards
+  the vec/tile pipeline lookups (miss falls through to the generic kernels).
+  Validated on gfx906: pre-fix exit 139 repro, post-fix the configs skip to
+  CPU; full FA suite otherwise unchanged. Upstream PR candidate.
 
 Dropped across the v0.86/v0.86.1/v0.87 syncs:
 
