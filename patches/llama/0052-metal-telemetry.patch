@@ -519,7 +519,7 @@ index af5c76778..635fc3680 100644
      });
  }
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
-index d58030a79..ac20cd3cc 100644
+index d58030a79..6155a7631 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.m
 +++ b/ggml/src/ggml-metal/ggml-metal-device.m
 @@ -20,16 +20,22 @@ static inline int tosh_moe_mode(void) { return TOSH_MOE_OFF; }
@@ -565,7 +565,7 @@ index d58030a79..ac20cd3cc 100644
      *res = (struct ggml_metal_pipeline) {
          /*.obj  =*/ nil,
      };
-@@ -857,31 +866,37 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
+@@ -857,38 +866,51 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
  
              GGML_LOG_ERROR("%s: incompatible pipeline %s\n", __func__, name);
  
@@ -594,6 +594,8 @@ index d58030a79..ac20cd3cc 100644
      id<MTLComputeCommandEncoder> obj;
 +#if GGML_METAL_TELEMETRY
 +    uint64_t tele_name_hash; // FNV-1a of the current pipeline name, 0 = none
++    void *   tele_cmd_buf;   // mode-3: the encoder's command buffer (sample-index space)
++    void *   tele_csb;       // mode-3: the CB's counter sample buffer (NULL if off/unsupported)
 +#endif
  };
  
@@ -602,8 +604,20 @@ index d58030a79..ac20cd3cc 100644
  
      id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
  
++#if GGML_METAL_TELEMETRY
++    res->tele_cmd_buf = cmd_buf_raw;
++    res->tele_csb     = tosh_tele_objc_csb_new(cmd_buf_raw, tosh_tele_dev_index(cmd_buf.device));
++#endif
++
      if (concurrent) {
-@@ -907,32 +922,41 @@ void ggml_metal_encoder_debug_group_push(ggml_metal_encoder_t encoder, const cha
+         res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
+     } else {
+         res->obj = [cmd_buf computeCommandEncoder];
+     }
+ 
+     [res->obj retain];
+ 
+@@ -907,39 +929,72 @@ void ggml_metal_encoder_debug_group_push(ggml_metal_encoder_t encoder, const cha
  }
  
  void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder) {
@@ -630,13 +644,28 @@ index d58030a79..ac20cd3cc 100644
  }
  
  void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
-     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
 +#if GGML_METAL_TELEMETRY
 +    const unsigned int tele_mode = TOSH_TELE_MODE();
++    if (tele_mode >= 3 && encoder->tele_csb) {
++        // boundary sample BEFORE the dispatch: dispatch i runs in [ts_i, ts_i+1]
++        uint32_t serial = 0;
++        const uint32_t idx = tosh_tele_objc_csb_next(encoder->tele_cmd_buf, &serial);
++        if (idx != UINT32_MAX && idx < TOSH_TELE_TT3_CAP) {
++            tosh_tele_objc_csb_sample(encoder->obj, encoder->tele_csb, idx);
++        }
++        [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
++        if (idx != UINT32_MAX) {
++            tosh_tele_dispatch3((uint32_t) tosh_tele_dev_index(encoder->obj.device),
++                                encoder->tele_name_hash, serial, idx,
++                                (uint64_t) tg0, (uint64_t) tg1, (uint64_t) tg2, (uint64_t) tptg0);
++        }
++        return;
++    }
 +    if (tele_mode) {
 +        tosh_tele_objc_dispatch(encoder->obj, encoder->tele_name_hash, tele_mode, tg0, tg1, tg2, tptg0, tptg1, tptg2);
 +    }
 +#endif
+     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
  }
  
  void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
@@ -644,8 +673,24 @@ index d58030a79..ac20cd3cc 100644
  }
  
  void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
++#if GGML_METAL_TELEMETRY
++    if (encoder->tele_csb) {
++        uint32_t serial = 0;
++        const uint32_t idx = tosh_tele_objc_csb_next(encoder->tele_cmd_buf, &serial);
++        if (idx != UINT32_MAX && idx < TOSH_TELE_TT3_CAP) {
++            tosh_tele_objc_csb_sample(encoder->obj, encoder->tele_csb, idx);
++        }
++    }
++#endif
      [encoder->obj endEncoding];
-@@ -1291,16 +1315,19 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
+ }
+ 
+ #define GGML_METAL_HOST_WRAP_MAX 256
+ 
+ struct ggml_metal_device {
+     id<MTLDevice> mtl_device;
+ 
+@@ -1291,16 +1346,19 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                      dev->mtl_device = ggml_metal_device_default_discrete();
                  }
                  [all release];
@@ -665,7 +710,7 @@ index d58030a79..ac20cd3cc 100644
                  dev->stage_lock = [[NSRecursiveLock alloc] init];
                  dev->wrap_lock  = [[NSLock alloc] init];
  
-@@ -1859,24 +1886,36 @@ struct ggml_metal_event {
+@@ -1859,24 +1917,36 @@ struct ggml_metal_event {
  };
  
  void ggml_metal_event_encode_signal(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw) {
@@ -702,7 +747,7 @@ index d58030a79..ac20cd3cc 100644
      ggml_metal_event_t ev = calloc(1, sizeof(struct ggml_metal_event));
  
      ev->obj = (__bridge void *)event;
-@@ -3731,16 +3770,21 @@ bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_dst, const struct ggml
+@@ -3731,16 +3801,21 @@ bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_dst, const struct ggml
          if (bid_src.metal == nil || bid_dst.metal == nil) {
              return false;
          }
@@ -726,10 +771,10 @@ index d58030a79..ac20cd3cc 100644
              [encoder endEncoding];
 diff --git a/ggml/src/ggml-metal/ggml-metal-telemetry.h b/ggml/src/ggml-metal/ggml-metal-telemetry.h
 new file mode 100644
-index 000000000..fc46014cd
+index 000000000..21fc7477d
 --- /dev/null
 +++ b/ggml/src/ggml-metal/ggml-metal-telemetry.h
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,102 @@
 +//
 +// ggml-metal-telemetry.h — glue between ggml-metal and the tosh-telemetry
 +// Rust staticlib (Phase-0 observability). Compiled only with
@@ -747,9 +792,13 @@ index 000000000..fc46014cd
 +
 +// -- direct Rust exports (libtosh_telemetry.a) ------------------------------
 +
-+// mode word: 0 = off, 1 = token mode, 2 = + per-dispatch metadata.
-+// Set once by tosh_tele_init(); read on hot paths with a relaxed atomic load.
++// mode word: 0 = off, 1 = token mode, 2 = + per-dispatch metadata, 3 = +
++// per-dispatch GPU boundary timestamps. Set once by tosh_tele_init(); read on
++// hot paths with a relaxed atomic load.
 +extern _Atomic unsigned int tosh_tele_g_mode;
++
++// mode-3 counter sample buffer capacity (boundary samples per command buffer)
++#define TOSH_TELE_TT3_CAP 16384
 +
 +void     tosh_tele_init(void);
 +unsigned tosh_tele_mode(void);
@@ -767,9 +816,17 @@ index 000000000..fc46014cd
 +                      uint64_t gpu_start_ns, uint64_t gpu_end_ns, uint64_t host_done_ns);
 +
 +uint64_t tosh_tele_name_register(const uint8_t * name, uint32_t name_len);
-+void tosh_tele_dispatch(uint32_t device, uint64_t name_hash,
++void     tosh_tele_dispatch(uint32_t device, uint64_t name_hash,
 +                        uint64_t tg0, uint64_t tg1, uint64_t tg2,
 +                        uint64_t tptg0, uint64_t tptg1, uint64_t tptg2);
++void     tosh_tele_dispatch3(uint32_t device, uint64_t name_hash,
++                        uint32_t cb_serial, uint32_t ord_in_cb,
++                        uint64_t tg0, uint64_t tg1, uint64_t tg2, uint64_t tptg0);
++void     tosh_tele_dts(uint32_t device, uint64_t graph, uint32_t cb_serial, uint32_t sample_idx, uint64_t ts_ns);
++// one per sampled CB: serial -> (cb_idx, gpu_start_ns, gpu_end_ns) anchor pair
++// for offline rate calibration of the raw boundary series
++void     tosh_tele_dts_cb(uint32_t device, uint64_t graph, uint32_t cb_serial,
++                          uint32_t cb_idx, uint64_t gpu_start_ns, uint64_t gpu_end_ns);
 +void tosh_tele_blit(uint32_t device, uint32_t kind, uint64_t nbytes, uint32_t dst_device);
 +void tosh_tele_ev(uint32_t device, uint32_t kind, uint32_t is_signal, uint64_t value);
 +
@@ -796,15 +853,36 @@ index 000000000..fc46014cd
 +                             long tg0, long tg1, long tg2,
 +                             long tptg0, long tptg1, long tptg2);
 +
++// -- mode 3: per-dispatch GPU boundary sampling (MTLCounterSampleBuffer) ------
++
++// get-or-create the counter sample buffer shared by every compute encoder on
++// this command buffer. NULL when mode != 3 or the device lacks dispatch-boundary
++// sampling (checked once per device).
++void * tosh_tele_objc_csb_new(void * cmd_buf, int device);
++
++// sample one dispatch boundary on the encoder (barrier NO: barrier YES would
++// serialize the pipeline and distort exactly what we measure).
++void tosh_tele_objc_csb_sample(void * encoder, void * csb, uint32_t sample_idx);
++
++// allocate the next boundary index for the CB (+ its serial for the join)
++uint32_t tosh_tele_objc_csb_next(void * cmd_buf, uint32_t * serial_out);
++
++// at CB completion: emit the serial->anchor map (EV_DTS_CB), resolve the buffer,
++// and emit one EV_DTS per boundary sample (keyed by the cb serial), then release
++// the entry. Called from the completed handler (runs after GPU completion, so the
++// samples are final).
++void tosh_tele_objc_csb_resolve(void * cmd_buf, int device, uint64_t graph,
++                                uint32_t cb_idx, uint64_t gpu_start_ns, uint64_t gpu_end_ns);
++
 +#ifdef __cplusplus
 +}
 +#endif
 diff --git a/ggml/src/ggml-metal/ggml-metal-telemetry.m b/ggml/src/ggml-metal/ggml-metal-telemetry.m
 new file mode 100644
-index 000000000..cc94d5862
+index 000000000..07ff346e4
 --- /dev/null
 +++ b/ggml/src/ggml-metal/ggml-metal-telemetry.m
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,357 @@
 +//
 +// ggml-metal-telemetry.m — ObjC glue for the tosh-telemetry staticlib.
 +// Added by patches/llama/metal/0055-telemetry.patch; compiled only with
@@ -975,6 +1053,11 @@ index 000000000..cc94d5862
 +                         (uint64_t) (cb.GPUStartTime    * 1e9),
 +                         (uint64_t) (cb.GPUEndTime      * 1e9),
 +                         tosh_tele_uptime_ns());
++        if (atomic_load_explicit(&tosh_tele_g_mode, memory_order_relaxed) >= 3) {
++            tosh_tele_objc_csb_resolve(cmd_buf_raw, device, graph, (uint32_t) cb_idx,
++                                       (uint64_t) (cb.GPUStartTime * 1e9),
++                                       (uint64_t) (cb.GPUEndTime   * 1e9));
++        }
 +    }];
 +}
 +
@@ -995,4 +1078,165 @@ index 000000000..cc94d5862
 +    tosh_tele_dispatch((uint32_t) dev, name_hash,
 +                       (uint64_t) tg0, (uint64_t) tg1, (uint64_t) tg2,
 +                       (uint64_t) tptg0, (uint64_t) tptg1, (uint64_t) tptg2);
++}
++
++// ---------------------------------------------------------------------------
++// mode 3: per-dispatch GPU boundary timestamps
++//
++// One counter sample buffer per command buffer (keyed by cmd_buf below), shared
++// by all compute encoders on that CB. Sample i is the GPU boundary before
++// dispatch i; the closing sample at encoder end is the last dispatch's end.
++
++#define TT3_CAP TOSH_TELE_TT3_CAP
++
++struct tt3_entry {
++    const void * cmd_buf;                 // key
++    id<MTLCounterSampleBuffer> csb;       // the sample buffer
++    _Atomic uint32_t next;                // next boundary index
++    uint32_t serial;                      // join key carried in dispatch3/dts
++};
++
++#define TT3_MAX_CB 64
++static struct tt3_entry s_tt3[TT3_MAX_CB];
++static _Atomic int    s_tt3_n = 0;
++static uint32_t       s_tt3_serial = 0;
++static _Atomic bool   s_tt3_lock = false;
++
++// per-device dispatch-boundary support, probed once (0 = unknown, 1 = yes, -1 = no)
++static int s_tt3_ok[16];
++
++static void tt3_lock(void) {
++    while (atomic_exchange_explicit(&s_tt3_lock, true, memory_order_acquire)) {
++    }
++}
++static void tt3_unlock(void) {
++    atomic_store_explicit(&s_tt3_lock, false, memory_order_release);
++}
++
++static int tt3_supported(id<MTLDevice> dev, int slot) {
++    int v = s_tt3_ok[slot];
++    if (v == 0) {
++        v = [dev supportsCounterSampling:MTLCounterSamplingPointAtDispatchBoundary] ? 1 : -1;
++        s_tt3_ok[slot] = v;
++    }
++    return v > 0;
++}
++
++// caller must hold tt3_lock
++static struct tt3_entry * tt3_find(const void * cmd_buf) {
++    const int n = atomic_load_explicit(&s_tt3_n, memory_order_relaxed);
++    for (int i = 0; i < n; ++i) {
++        if (s_tt3[i].cmd_buf == cmd_buf) {
++            return &s_tt3[i];
++        }
++    }
++    return NULL;
++}
++
++// get-or-create the per-CB entry; returns its serial via serial_out
++static void * tt3_get_or_create(void * cmd_buf_raw, int device, uint32_t * serial_out) {
++    if (atomic_load_explicit(&tosh_tele_g_mode, memory_order_relaxed) < 3) {
++        return NULL;
++    }
++    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
++    if (!tt3_supported(cmd_buf.device, device)) {
++        return NULL;
++    }
++    @autoreleasepool {
++        tt3_lock();
++        struct tt3_entry * e = tt3_find(cmd_buf_raw);
++        if (!e) {
++            const int n = atomic_load_explicit(&s_tt3_n, memory_order_relaxed);
++            if (n < TT3_MAX_CB) {
++                id<MTLCounterSet> ts_set = nil;
++                for (id<MTLCounterSet> cs in cmd_buf.device.counterSets) {
++                    if ([cs.name isEqualToString:@"timestamp"]) {
++                        ts_set = cs;
++                        break;
++                    }
++                }
++                if (ts_set) {
++                    MTLCounterSampleBufferDescriptor * desc = [MTLCounterSampleBufferDescriptor new];
++                    desc.counterSet  = ts_set;
++                    desc.storageMode = MTLStorageModeShared;
++                    desc.sampleCount = TT3_CAP;
++                    id<MTLCounterSampleBuffer> csb =
++                        [cmd_buf.device newCounterSampleBufferWithDescriptor:desc error:nil];
++                    [desc release];
++                    if (csb) {
++                        e = &s_tt3[n];
++                        e->cmd_buf = cmd_buf_raw;
++                        e->csb     = csb;
++                        atomic_store_explicit(&e->next, 0, memory_order_relaxed);
++                        e->serial  = ++s_tt3_serial;
++                        atomic_store_explicit(&s_tt3_n, n + 1, memory_order_relaxed);
++                    }
++                }
++            }
++        }
++        if (e) {
++            *serial_out = e->serial;
++        }
++        tt3_unlock();
++        return e ? (void *) e->csb : NULL;
++    }
++}
++
++void * tosh_tele_objc_csb_new(void * cmd_buf_raw, int device) {
++    uint32_t serial = 0;
++    return tt3_get_or_create(cmd_buf_raw, device, &serial);
++}
++
++void tosh_tele_objc_csb_sample(void * encoder_raw, void * csb_raw, uint32_t sample_idx) {
++    id<MTLComputeCommandEncoder> enc = (id<MTLComputeCommandEncoder>) encoder_raw;
++    [enc sampleCountersInBuffer:(id<MTLCounterSampleBuffer>) csb_raw
++                   atSampleIndex:sample_idx
++                     withBarrier:NO];
++}
++
++// allocate the next boundary index for this CB (serial via serial_out)
++uint32_t tosh_tele_objc_csb_next(void * cmd_buf_raw, uint32_t * serial_out) {
++    uint32_t idx = UINT32_MAX;
++    tt3_lock();
++    struct tt3_entry * e = tt3_find(cmd_buf_raw);
++    if (e) {
++        *serial_out = e->serial;
++        idx = e->next++;
++    }
++    tt3_unlock();
++    return idx;
++}
++
++void tosh_tele_objc_csb_resolve(void * cmd_buf_raw, int device, uint64_t graph,
++                                uint32_t cb_idx, uint64_t gpu_start_ns, uint64_t gpu_end_ns) {
++    @autoreleasepool {
++        tt3_lock();
++        struct tt3_entry * e = tt3_find(cmd_buf_raw);
++        if (e) {
++            const uint32_t n      = e->next;
++            const uint32_t serial = e->serial;
++            // the serial->anchor mapping goes out first: offline tools calibrate the
++            // raw boundary series against this CB's gpu start/end pair
++            tosh_tele_dts_cb((uint32_t) device, graph, serial, cb_idx, gpu_start_ns, gpu_end_ns);
++            if (n > 0) {
++                NSData * data = [e->csb resolveCounterRange:NSMakeRange(0, n)];
++                if (data) {
++                    const uint64_t * ts  = (const uint64_t *) data.bytes;
++                    const uint32_t   cnt = (uint32_t) (data.length / sizeof(uint64_t));
++                    for (uint32_t i = 0; i < n && i < cnt; ++i) {
++                        tosh_tele_dts((uint32_t) device, graph, serial, i, ts[i]);
++                    }
++                }
++            }
++            [e->csb release];
++            // compact: swap the last entry into this slot, shrink
++            const int last = s_tt3_n - 1;
++            const int idx  = (int) (e - s_tt3);
++            if (idx != last) {
++                s_tt3[idx] = s_tt3[last];
++            }
++            atomic_store_explicit(&s_tt3_n, last, memory_order_relaxed);
++        }
++        tt3_unlock();
++    }
 +}
