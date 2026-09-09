@@ -100,6 +100,18 @@ below):
   control, and 2-die tensor 105.3 -> 116.9 t/s (the collision was stalling
   it too). Note: `-sm tensor` is the ToshLLM app default, so this bit every
   multi-die AMD user. Upstream PR candidate (strong).
+- `0059-spec-timing-instrumentation.patch` — TOSH_SPEC_TIMING phase timers in
+  the speculative-simple example (draft/ckpt/verify/process/accept per-round
+  breakdown). FORK-LOCAL: profiling tool, not for upstream.
+- `0060-metal-gdn-wave64.patch` — gated_delta_net float4 state IO under
+  NSG==4 (2.83x decode / 4.13x verify at qwen4exp shapes, 700 GB/s ~= the
+  practical HBM ceiling), plus new kernel_ssm_scan_f32_dec wave64 decode
+  variant (2.78x, mamba-family; fires only at n_seq_tokens==1 &&
+  simd_width==64 && d_state==2*simd_width). Note: the in-model GDN op is
+  gated_delta_net, not ssm_scan/conv — verified via dispatch telemetry.
+  E2E: 22.9 -> 23.4 t/s baseline, MTP verify wall 59.2 -> 50.0 ms.
+  Correctness: full GATED_DELTA_NET + new K=2 cases pass, E2E byte-identical.
+  Upstream PR candidate.
 
 Dropped across the v0.86/v0.86.1/v0.87 syncs:
 
