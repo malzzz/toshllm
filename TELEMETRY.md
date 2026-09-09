@@ -88,6 +88,18 @@ below):
   in-tree edit from the Linux bring-up that was never in the series (the
   v0.87 round-trip diff caught it). FORK-LOCAL: Linux-only, upstream is
   macOS+AMD.
+- `0058-metal-xdev-exchange-channel.patch` — ggml-metal-context.m: the fused
+  butterfly exchange (`ggml_metal_exchange_reduce`) shared the `xdev_link`
+  seq counter, ready/done events, and host wrap buffers with the unfused
+  cpy_xdev_events/peer copy paths. Runs mixing both schemes on one link
+  (4-die tensor split: unfused at prefill sizes, fused at decode sizes)
+  desynchronize the event waits and silently corrupt the collective. The
+  exchange gets its own events/counter/wrap buffers. Repro: ANY arch corrupt
+  under 4-die `-sm tensor` (dense 1B first-token junk, qwen35moe zeros,
+  qwen4exp babble); post-fix 3/3 exact matches incl. qwen4exp == layer-split
+  control, and 2-die tensor 105.3 -> 116.9 t/s (the collision was stalling
+  it too). Note: `-sm tensor` is the ToshLLM app default, so this bit every
+  multi-die AMD user. Upstream PR candidate (strong).
 
 Dropped across the v0.86/v0.86.1/v0.87 syncs:
 
