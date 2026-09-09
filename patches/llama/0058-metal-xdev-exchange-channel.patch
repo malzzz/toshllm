@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
-index 635fc3680..dad4f8ad9 100644
+index 635fc3680..840c7b564 100644
 --- a/ggml/src/ggml-metal/ggml-metal-context.m
 +++ b/ggml/src/ggml-metal/ggml-metal-context.m
 @@ -296,16 +296,24 @@ struct ggml_metal {
@@ -84,7 +84,26 @@ index 635fc3680..dad4f8ad9 100644
  
      return link;
  }
-@@ -1108,16 +1128,53 @@ static bool ggml_metal_xdev_link_reserve(ggml_metal_t ctx_src, ggml_metal_t ctx_
+@@ -1080,16 +1100,18 @@ static bool ggml_metal_xdev_link_reserve(ggml_metal_t ctx_src, ggml_metal_t ctx_
+ 
+     if (link->cap < size) {
+         // resizing frees pages a queued blit may still read; wait out the link first
+         if (link->seq > 0 && ![link->ev_done waitUntilSignaledValue:link->seq timeoutMS:10000]) {
+             return false;
+         }
+         [link->wrap_src release];
+         [link->wrap_dst release];
++        link->wrap_src = nil;
++        link->wrap_dst = nil;
+         free(link->host);
+         link->cap = MAX(size, (size_t) 1*1024*1024);
+         if (posix_memalign(&link->host, (size_t) sysconf(_SC_PAGESIZE), link->cap) != 0) {
+             link->host = NULL;
+             link->cap  = 0;
+             return false;
+         }
+         id<MTLDevice> dev_src = ggml_metal_device_get_obj(ctx_src->dev);
+@@ -1108,16 +1130,55 @@ static bool ggml_metal_xdev_link_reserve(ggml_metal_t ctx_src, ggml_metal_t ctx_
              link->host = NULL;
              link->cap  = 0;
              return false;
@@ -103,6 +122,8 @@ index 635fc3680..dad4f8ad9 100644
 +        }
 +        [link->wrap_x_src release];
 +        [link->wrap_x_dst release];
++        link->wrap_x_src = nil;
++        link->wrap_x_dst = nil;
 +        free(link->host_x);
 +        link->cap_x = MAX(size, (size_t) 1*1024*1024);
 +        if (posix_memalign(&link->host_x, (size_t) sysconf(_SC_PAGESIZE), link->cap_x) != 0) {
@@ -138,7 +159,7 @@ index 635fc3680..dad4f8ad9 100644
      static int val = -1;
      if (val < 0) {
          const char * v = getenv("TOSH_MGPU_PEER_SELF");
-@@ -1569,51 +1626,54 @@ bool ggml_metal_exchange_reduce(ggml_metal_t ctx_self, ggml_metal_t ctx_peer,
+@@ -1569,51 +1630,54 @@ bool ggml_metal_exchange_reduce(ggml_metal_t ctx_self, ggml_metal_t ctx_peer,
  
      struct ggml_metal_buffer_id bid_self = ggml_metal_get_buffer_id(t_self);
      struct ggml_metal_buffer_id bid_tmp  = ggml_metal_get_buffer_id(tmp_self);

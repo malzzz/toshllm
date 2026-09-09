@@ -1,0 +1,204 @@
+diff --git a/examples/speculative-simple/speculative-simple.cpp b/examples/speculative-simple/speculative-simple.cpp
+index 487ae03ab..a7d6db3d7 100644
+--- a/examples/speculative-simple/speculative-simple.cpp
++++ b/examples/speculative-simple/speculative-simple.cpp
+@@ -154,17 +154,25 @@ int main(int argc, char ** argv) {
+     llama_tokens draft;
+ 
+     common_prompt_checkpoint ckpt;
+ 
+     const auto t_enc_end = ggml_time_us();
+ 
+     const auto t_dec_start = ggml_time_us();
+ 
++    // temporary phase timing for the spec round (TOSH_SPEC_TIMING=1): host-logistics profiling
++    const bool spec_timing = getenv("TOSH_SPEC_TIMING") != nullptr;
++    double acc_draft = 0, acc_ckpt_save = 0, acc_verify = 0, acc_process = 0, acc_accept = 0,
++           acc_ckpt_load = 0, acc_postproc = 0, acc_seqrm = 0;
++    int n_rounds = 0, n_partials = 0;
++
+     while (true) {
++        auto t0 = spec_timing ? ggml_time_us() : 0;
++        auto t1 = t0, t2 = t0;
+         // generate or reuse draft tokens
+         //
+         // this is the most important part of the speculation. the more probable tokens that are provided here
+         // the better the performance will be. in theory, this computation can be performed asynchronously and even
+         // offloaded to a remote device. it doesn't even have to be based on an LLM. instead, it can provide tokens
+         // from a cache or lookup tables.
+         //
+         if (draft.empty()) {
+@@ -188,17 +196,19 @@ int main(int argc, char ** argv) {
+             common_speculative_get_draft_params(spec, seq_id) = {
+                 /* .drafting   = */ true,
+                 /* .n_max      = */ n_draft_max,
+                 /* .n_past     = */ n_past,
+                 /* .id_last    = */ id_last,
+                 /* .prompt     = */ &prompt_tgt,
+                 /* .result     = */ &draft, // output
+             };
++            t0 = spec_timing ? ggml_time_us() : 0;
+             common_speculative_draft(spec);
++            t1 = spec_timing ? ggml_time_us() : 0;
+ 
+             // save a checkpoint of the target context before evaluating the draft
+             // this allows us to restore the state if partial draft acceptance occurs
+             if (!draft.empty()) {
+                 if (use_ckpt_tgt) {
+                     ckpt.update_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                 }
+             }
+@@ -206,43 +216,51 @@ int main(int argc, char ** argv) {
+             // reset the draft context to the checkpoint before verification
+             if (ctx_dft) {
+                 if (use_ckpt_dft) {
+                     ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                 }
+ 
+                 llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, ckpt.pos_max + 1, -1);
+             }
++            t2 = spec_timing ? ggml_time_us() : 0;
++            if (spec_timing) { acc_draft += (t1-t0)/1e3; acc_ckpt_save += (t2-t1)/1e3; n_rounds++; }
+         } else {
+             // we have a previous (partial) draft to reuse from checkpoint restoration
+             if (use_ckpt_tgt) {
+                 GGML_ASSERT(!ckpt.empty());
+             }
+         }
+ 
+         // always have a token to evaluate from before - id_last
++        auto t3 = spec_timing ? ggml_time_us() : 0;
+         common_batch_clear(batch_tgt);
+         common_batch_add  (batch_tgt, id_last, n_past++, { seq_id }, true);
+ 
+         // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
+         {
+             for (size_t i = 0; i < draft.size(); ++i) {
+                 common_batch_add(batch_tgt, draft[i], n_past + i, { seq_id }, true);
+             }
+ 
+             //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
+ 
+             llama_decode(ctx_tgt, batch_tgt);
++            auto t4 = spec_timing ? ggml_time_us() : 0;
++            if (spec_timing) { acc_verify += (t4-t3)/1e3; }
+         }
+ 
++        auto t5 = spec_timing ? ggml_time_us() : 0;
+         // feed the batch to the speculative implementation(s) - this drives the draft model, MTP, Eagle3, etc.
+         if (!common_speculative_process(spec, batch_tgt)) {
+             LOG_ERR("%s", "failed to process speculative batch\n");
+             break;
+         }
++        auto t6 = spec_timing ? ggml_time_us() : 0;
++        if (spec_timing) { acc_process += (t6-t5)/1e3; }
+ 
+         // only save the sampler sampler state if we use checkpoints
+         common_sampler_ptr smpl_save;
+         if (use_ckpt_tgt) {
+             smpl_save.reset(common_sampler_clone(smpl.get()));
+         }
+ 
+         // save the size of the draft being verified
+@@ -251,50 +269,57 @@ int main(int argc, char ** argv) {
+         // sample from the full target batch and return the accepted tokens based on the target sampler
+         //
+         // for each token to be accepted, the sampler would have to sample that same token
+         // in such cases, instead of decoding the sampled token as we normally do, we simply continue with the
+         // available logits from the batch and sample the next token until we run out of logits or the sampler
+         // disagrees with the draft
+         //
+         auto ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
++        auto t7 = spec_timing ? ggml_time_us() : 0;
++        if (spec_timing) { acc_accept += (t7-t6)/1e3; }
+ 
+         //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
+ 
+         GGML_ASSERT(ids.size() > 0); // there will always be at least one accepted token
+ 
+         // check for partial draft acceptance:
+         // if the context doesn't support partial sequence removal, restore the checkpoint
+         // and make the accepted tokens the new partial draft for the next iteration
+         if (use_ckpt_tgt && ids.size() - 1 < n_draft) {
+             LOG_DBG("partial acceptance: %zu < %zu, restoring checkpoint\n", ids.size() - 1, n_draft);
+ 
+             draft = std::move(ids);
+ 
+             {
++                auto t8 = spec_timing ? ggml_time_us() : 0;
+                 ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+ 
+                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, ckpt.pos_max + 1, -1);
+-            }
++                auto t9 = spec_timing ? ggml_time_us() : 0;
+ 
+-            if (ctx_dft) {
+-                ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                if (ctx_dft) {
++                    ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+ 
+-                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, ckpt.pos_max + 1, -1);
++                    llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, ckpt.pos_max + 1, -1);
++                }
++                auto t10 = spec_timing ? ggml_time_us() : 0;
++                if (spec_timing) { acc_ckpt_load += (t9-t8)/1e3 + (t10-t9)/1e3; n_partials++; }
+             }
+ 
+             prompt_tgt.resize(ckpt.n_tokens);
+             smpl = std::move(smpl_save);
+ 
+             n_past = (int) prompt_tgt.size();
+ 
+             continue;
+         }
+ 
+         common_speculative_accept(spec, seq_id, ids.size() - 1);
++        auto t11 = spec_timing ? ggml_time_us() : 0;
+ 
+         // full acceptance: consume the draft and commit accepted tokens
+         n_past    += ids.size() - 1;
+         n_drafted += n_draft; // note: we ignore the discarded small drafts
+         n_accept  += ids.size() - 1;
+         n_predict += ids.size();
+ 
+         // process the accepted tokens and update contexts
+@@ -324,30 +349,39 @@ int main(int argc, char ** argv) {
+         LOG_DBG("accepted %d/%d draft tokens, the last target token is: (%d)\n", (int) ids.size() - 1, (int) draft.size(), id_last);
+ 
+         // clear the draft since it has been consumed
+         draft.clear();
+ 
+         {
+             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
+ 
++            auto t12 = spec_timing ? ggml_time_us() : 0;
+             llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, n_past, -1);
+ 
+             if (ctx_dft) {
+                 llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n_past, -1);
+             }
++            if (spec_timing) { auto t13 = ggml_time_us(); acc_postproc += (t12-t11)/1e3; acc_seqrm += (t13-t12)/1e3; }
+         }
+ 
+         if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
+             break;
+         }
+     }
+ 
+     auto t_dec_end = ggml_time_us();
+ 
++    if (spec_timing) {
++        const double total = acc_draft + acc_ckpt_save + acc_verify + acc_process + acc_accept + acc_ckpt_load + acc_postproc + acc_seqrm;
++        LOG_INF("spec-timing (ms, %d rounds, %d partials): draft=%.1f ckpt_save=%.1f verify=%.1f process=%.1f accept=%.1f ckpt_load=%.1f postproc=%.1f seqrm=%.1f | accounted=%.1f of %.1f\n",
++                n_rounds, n_partials, acc_draft, acc_ckpt_save, acc_verify, acc_process, acc_accept,
++                acc_ckpt_load, acc_postproc, acc_seqrm, total, (t_dec_end - t_dec_start)/1e3);
++    }
++
+     const int n_input = inp.size();
+ 
+     LOG("\n\n");
+ 
+     LOG_INF("encoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_input,   (t_enc_end - t_enc_start) / 1e6f, inp.size() / ((t_enc_end - t_enc_start) / 1e6f));
+     LOG_INF("decoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_predict, (t_dec_end - t_dec_start) / 1e6f, n_predict  / ((t_dec_end - t_dec_start) / 1e6f));
+ 
+     LOG_INF("\n");
