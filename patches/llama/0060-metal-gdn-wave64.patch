@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
-index ee8ccc1ed..3a189d585 100644
+index ee8ccc1ed..90c9e1298 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
 @@ -664,16 +664,34 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan(ggml_me
@@ -37,11 +37,59 @@ index ee8ccc1ed..3a189d585 100644
      snprintf(name, 256, "%s", base);
  
      ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+@@ -723,43 +741,45 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv(ggml_metal_
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+     }
+ 
+     return res;
+ }
+ 
+-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(ggml_metal_library_t lib, const ggml_tensor * op) {
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(ggml_metal_library_t lib, const ggml_tensor * op, bool vec4) {
+     char base[256];
+     char name[256];
+ 
+     // v is src[2], dimensions: S_v = ne[0], H = ne[1]
+     const int ne20 = op->src[2]->ne[0]; // S_v
+     const int ne21 = op->src[2]->ne[1]; // H
+     const int ne30 = op->src[3]->ne[0]; // G
+     // state is src[5], 4D [S_v, S_v, H_v, n_seqs] (s0 only); K is op param 0.
+     const int K = ggml_get_op_params_i32(op, 0);
+ 
+     const int nsg = op->src[2]->ne[0]/32;
+ 
+     GGML_ASSERT(op->src[5]->type == GGML_TYPE_F32);
+     GGML_ASSERT(op->ne[0] == ne20 * ne21);
+     GGML_ASSERT(ne20 % 32 == 0);
+ 
++    // the vec4 path moves 16B per lane; require it on top of wave64 (checked by the caller)
+     snprintf(base, 256, "kernel_gated_delta_net_%s_%d", ggml_type_name(op->src[0]->type), nsg);
+-    snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d", base, ne20, ne30, K);
++    snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d%s", base, ne20, ne30, K, vec4 ? "_v4" : "");
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+         ggml_metal_cv_t cv = ggml_metal_cv_init();
+ 
+         ggml_metal_cv_set_int16(cv, ne20, FC_GATED_DELTA_NET + 0);
+         ggml_metal_cv_set_int16(cv, ne30, FC_GATED_DELTA_NET + 1);
+         ggml_metal_cv_set_int16(cv, K,    FC_GATED_DELTA_NET + 2);
++        ggml_metal_cv_set_int16(cv, vec4 ? 1 : 0, FC_GATED_DELTA_NET + 3);
+ 
+         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+ 
+         ggml_metal_cv_free(cv);
+     }
+ 
+     res.nsg = nsg;
+ 
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
-index a5fdf4dae..18bb07b6e 100644
+index a5fdf4dae..2ea6bfe94 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.h
 +++ b/ggml/src/ggml-metal/ggml-metal-device.h
-@@ -129,16 +129,17 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cumsum_ad
+@@ -129,19 +129,20 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cumsum_ad
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_tri               (ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max          (ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -53,14 +101,18 @@ index a5fdf4dae..18bb07b6e 100644
 +struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_dec      (ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_ssd_mma  (ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv              (ggml_metal_library_t lib, const struct ggml_tensor * op);
- struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
+-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op, bool vec4);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_turbo_wht         (ggml_metal_library_t lib);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri         (ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg, int nr0);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
-index a7ddf1a64..c4a79da2c 100644
+index a7ddf1a64..62b1433ad 100644
 --- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
 @@ -2020,16 +2020,23 @@ int ggml_metal_op_ssm_scan(ggml_metal_op_t ctx, int idx) {
@@ -87,11 +139,64 @@ index a7ddf1a64..c4a79da2c 100644
      dispatch(
          ggml_metal_library_get_pipeline_ssm_scan_ssd_mma(lib, op),
          OP_SSM_SCAN_SSD_NSG*32,
+@@ -2098,17 +2105,33 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+     GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+     GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
+     GGML_TENSOR_LOCALS(uint64_t, nb2, op->src[2], nb);
+     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+ 
+-    auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
++    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
++
++    // the vec4 kernel path moves 16B per lane: wave64-only, and only when every float4
++    // access stays 16B-aligned - 4B-granular view offsets would misalign it otherwise
++    bool vec4 = props_dev->simd_width == 64 && ne20/32 == 4;
++    if (vec4) {
++        const auto off16 = [](const ggml_tensor * t) {
++            return ggml_metal_get_buffer_id(t).offs % 16 == 0;
++        };
++        vec4 = off16(op->src[0]) && off16(op->src[1]) && off16(op->src[5]) && off16(op) &&
++               op->src[0]->nb[1] % 16 == 0 && op->src[0]->nb[3] % 16 == 0 &&  // q head/seq rows
++               op->src[1]->nb[1] % 16 == 0 && op->src[1]->nb[3] % 16 == 0 &&  // k
++               (op->src[0]->nb[2]/sizeof(float)) % 4 == 0 &&                 // q token step
++               (op->src[1]->nb[2]/sizeof(float)) % 4 == 0;                   // k token step
++    }
++
++    auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op, vec4);
+ 
+     int ida = 0;
+ 
+     ggml_metal_kargs_gated_delta_net args = {
+         /*.ne00 =*/ ne00,
+         /*.ne01 =*/ ne01,
+         /*.ne02 =*/ ne02,
+         /*.ne03 =*/ ne03,
 diff --git a/ggml/src/ggml-metal/kernels/gated_delta_net.metal b/ggml/src/ggml-metal/kernels/gated_delta_net.metal
-index 98fa33860..6cc8b41b1 100644
+index 98fa33860..8167a5c74 100644
 --- a/ggml/src/ggml-metal/kernels/gated_delta_net.metal
 +++ b/ggml/src/ggml-metal/kernels/gated_delta_net.metal
-@@ -45,19 +45,28 @@ kernel void kernel_gated_delta_net_impl(
+@@ -1,13 +1,17 @@
+ #include "common.h"
+ 
+ constant short FC_gated_delta_net_ne20 [[function_constant(FC_GATED_DELTA_NET + 0)]];
+ constant short FC_gated_delta_net_ne30 [[function_constant(FC_GATED_DELTA_NET + 1)]];
+ constant short FC_gated_delta_net_K    [[function_constant(FC_GATED_DELTA_NET + 2)]];
++// set only on wave64 with 16B-aligned q/k/state/dst: the NSG==4 column pack then
++// moves as single float4 loads/stores instead of 4 scalar accesses each
++constant short FC_gated_delta_net_vec4 [[function_constant(FC_GATED_DELTA_NET + 3)]];
++#define GDN_VEC4 (FC_gated_delta_net_vec4 == 1)
+ static inline float gdn_sum32(float v) {
+     v += simd_shuffle_xor(v, 16);
+     v += simd_shuffle_xor(v,  8);
+     v += simd_shuffle_xor(v,  4);
+     v += simd_shuffle_xor(v,  2);
+     v += simd_shuffle_xor(v,  1);
+     return v;
+ }
+@@ -45,19 +49,28 @@ kernel void kernel_gated_delta_net_impl(
  
      // input state layout [S_v, S_v, H, n_seqs] (s0 only): per-seq stride is H*D.
      // state is stored transposed: M[i20][is] = S[is][i20], so row i20 is contiguous
@@ -104,8 +209,8 @@ index 98fa33860..6cc8b41b1 100644
 -        const short is = tx*NSG + j;
 -        ls[j] = s_ptr[is];
 +    // NSG consecutive state columns per thread: 16B-aligned, so move them as one float4
-+    // instead of 4 scalar accesses (GCN wants 128-bit lanes)
-+    if (NSG == 4) {
++    // instead of 4 scalar accesses (GCN wants 128-bit lanes; host checks alignment)
++    if (GDN_VEC4) {
 +        const float4 tmp = *(device const float4 *) (s_ptr + tx*NSG);
 +        FOR_UNROLL (short j = 0; j < NSG; j++) {
 +            ls[j] = tmp[j];
@@ -123,7 +228,7 @@ index 98fa33860..6cc8b41b1 100644
      device const float * k_ptr = (device const float *) (k + i23*args.nb13 + i11*args.nb11);
      device const float * v_ptr = (device const float *) (v + i23*args.nb23 + i21*args.nb21);
  
-@@ -76,42 +85,57 @@ kernel void kernel_gated_delta_net_impl(
+@@ -76,42 +89,57 @@ kernel void kernel_gated_delta_net_impl(
  
      for (short t = 0; t < args.ne22; t++) {
          float s_k = 0.0f;
@@ -145,7 +250,7 @@ index 98fa33860..6cc8b41b1 100644
 +            }
 +        }
  
-+        if (NSG == 4) {
++        if (GDN_VEC4) {
 +            const float4 k4 = *(device const float4 *) (k_ptr + tx*NSG);
 +            FOR_UNROLL (short j = 0; j < NSG; j++) {
 +                s_k += ls[j]*k4[j];
@@ -168,7 +273,7 @@ index 98fa33860..6cc8b41b1 100644
 -            ls[j] += k_ptr[is]*d;
 -
 -            y += ls[j]*q_ptr[is];
-+        if (NSG == 4) {
++        if (GDN_VEC4) {
 +            const float4 k4 = *(device const float4 *) (k_ptr + tx*NSG);
 +            const float4 q4 = *(device const float4 *) (q_ptr + tx*NSG);
 +            FOR_UNROLL (short j = 0; j < NSG; j++) {
@@ -189,7 +294,7 @@ index 98fa33860..6cc8b41b1 100644
              dst_attn[t*args.ne21*S_v] = y*scale;
          }
  
-@@ -121,29 +145,45 @@ kernel void kernel_gated_delta_net_impl(
+@@ -121,29 +149,45 @@ kernel void kernel_gated_delta_net_impl(
  
          b_ptr += args.ne21;
          g_ptr += args.ne21*G;
@@ -201,7 +306,7 @@ index 98fa33860..6cc8b41b1 100644
 -                FOR_UNROLL (short j = 0; j < NSG; j++) {
 -                    const short is = tx*NSG + j;
 -                    dst_state[is] = ls[j];
-+                if (NSG == 4) {
++                if (GDN_VEC4) {
 +                    float4 tmp;
 +                    FOR_UNROLL (short j = 0; j < NSG; j++) {
 +                        tmp[j] = ls[j];
@@ -222,7 +327,7 @@ index 98fa33860..6cc8b41b1 100644
 -        FOR_UNROLL (short j = 0; j < NSG; j++) {
 -            const short is = tx*NSG + j;
 -            dst_state[is] = ls[j];
-+        if (NSG == 4) {
++        if (GDN_VEC4) {
 +            float4 tmp;
 +            FOR_UNROLL (short j = 0; j < NSG; j++) {
 +                tmp[j] = ls[j];
@@ -323,3 +428,185 @@ index 6fff5b34c..badca02d4 100644
          device const void * src0,
          device const void * src1,
          device const void * src2,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index c7f2cad03..b48405a08 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4489,26 +4489,27 @@ struct test_gated_delta_net : public test_case {
+     const int64_t head_count;
+     const int64_t head_size;
+     const int64_t n_seq_tokens;
+     const int64_t n_seqs;
+     const int     v_repeat;
+     const bool    permuted;
+     const bool    kda;
+     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
++    const bool      misalign; // state view shifted +4B off the 16B vector boundary
+ 
+     std::string vars() override {
+         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
+     }
+ 
+     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
+             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
+-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
++            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool misalign = false)
+         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
++          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), misalign(misalign) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * q;
+         ggml_tensor * k;
+         ggml_tensor * v;
+         if (permuted) {
+             // create with dims 1 and 2 swapped, then permute back to get non-contiguous layout
+             q = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs), 0, 2, 1, 3);
+@@ -4520,17 +4521,26 @@ struct test_gated_delta_net : public test_case {
+             v = ggml_new_tensor_4d(ctx, type, head_size, head_count * v_repeat, n_seq_tokens, n_seqs);
+         }
+         ggml_set_name(q, "q");
+         ggml_set_name(k, "k");
+         ggml_set_name(v, "v");
+         const int64_t g_ne0 = kda ? head_size : 1;
+         ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, g_ne0, head_count * v_repeat, n_seq_tokens, n_seqs);
+         ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
+-        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count * v_repeat, n_seqs);
++        ggml_tensor * state;
++        if (misalign) {
++            // packed layout at a +4B offset: strides are the packed ones, base is 4B off
++            const int64_t nel = head_size*head_size*head_count*v_repeat*n_seqs;
++            ggml_tensor * pad = ggml_new_tensor_1d(ctx, type, nel + 1);
++            state = ggml_view_4d(ctx, pad, head_size, head_size, head_count * v_repeat, n_seqs,
++                    pad->nb[0]*head_size, pad->nb[0]*head_size*head_size, pad->nb[0]*head_size*head_size*head_count*v_repeat, 4);
++        } else {
++            state = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count * v_repeat, n_seqs);
++        }
+         ggml_set_name(g,     "g");
+         ggml_set_name(beta,  "beta");
+         ggml_set_name(state, "state");
+         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
+         q = ggml_l2_norm(ctx, q, 1e-6f);
+         k = ggml_l2_norm(ctx, k, 1e-6f);
+         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+         return out;
+@@ -8687,16 +8697,30 @@ static const ggml_type other_types[] = {
+ #ifdef _MSC_VER
+ // Workaround long compile time with msvc
+ #pragma optimize("", off)
+ #endif
+ 
+ // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
++
++    // qwen4exp GDN decode shapes: exercise kernel_ssm_scan_f32_dec (wave64, n_t=1, d_state=128)
++    if (getenv("QWEN4EXP_PERF") != nullptr) {
++        test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 128, 48, 16, 1, 1));
++        test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 128, 48, 16, 1, 2));  // two seqs
++        test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 128, 48, 16, 3, 1));  // multi-token: generic path
++        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4, 10240, 1, 1}, {4, 10240, 1, 1}));
++        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, 1, 1, false, false, 2)); // K=2 snapshots
++        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, 1, 1, true,  false, 2)); // K=2 + kda
++        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 3, 1, 1, false, false, 2)); // K=2 multi-token
++        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 2, 2, 1, false, false, 2)); // K=2 two seqs
++        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, 1, 1, false, false, 2, true)); // misaligned state
++        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, 1, 1, false, true,  2, true)); // misaligned + kda
++    }
+     std::default_random_engine rng(0);
+ 
+     // unary ops
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+         for (int v : {0, 1}) {
+             for (int op = 0; op < GGML_UNARY_OP_COUNT; op++) {
+                 if (op == GGML_UNARY_OP_XIELU) {
+                     continue; // need extra params, separate test
+@@ -10448,16 +10472,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+ 
+     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
+     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 1024,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+ 
++    // LOCAL ONLY (not for upstream): gfx906 validation cases for the 0055 guard patch.
++    // dk384/640 non-turbo: pre-fix these crash the process (null pipeline deref);
++    // post-fix they must be skipped as unsupported. Plus the gap coverage from the
++    // wave64 validation run (320/256 q8_0, kv=257/1025 decode sweep).
++    test_cases.emplace_back(new test_flash_attn_ext(384, 384, 4, {1, 1}, 113, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    test_cases.emplace_back(new test_flash_attn_ext(640, 640, 4, {1, 1}, 113, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    for (int kv : { 257, 1025 }) {
++        for (ggml_type tk : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
++            for (ggml_type tv : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
++                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, tk, tv));
++            }
++        }
++        for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
++            test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, { 1, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, t, t));
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, t, t));
++            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {16, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, t, t));
++        }
++        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 1, 2, 3}, true, true));
++        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
++        test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
++        test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
++    }
++
+     // Sparse mask hint: supported decode/prefill layouts and dense fallbacks.
+     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 2}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  768));
+     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
+     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 2}, 4096, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   768));
+     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2304));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+@@ -10750,16 +10797,48 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ #ifdef _MSC_VER
+ #pragma optimize("", on)
+ #endif
+ 
+ // Test cases for performance evaluation: should be representative of real-world use cases
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // qwen4exp decode-shape perf cases (Flash-Next: hidden 2560, hc 4x10240, 512x640 experts, GDN 48x128x128)
++    if (getenv("QWEN4EXP_PERF") != nullptr) {
++        const ggml_type Q = GGML_TYPE_Q4_K; const ggml_type F = GGML_TYPE_F32;
++        test_cases.emplace_back(new test_mul_mat(Q, F, 12288, 1,  2560, {1,1}, {1,1})); // attn q+gate
++        test_cases.emplace_back(new test_mul_mat(Q, F,   512, 1,  2560, {1,1}, {1,1})); // attn k/v
++        test_cases.emplace_back(new test_mul_mat(Q, F,  2560, 1,  6144, {1,1}, {1,1})); // attn o
++        test_cases.emplace_back(new test_mul_mat(Q, F,   640, 1,  2560, {1,1}, {1,1})); // expert up/gate (per expert)
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_0, F, 2560, 1, 640, {1,1}, {1,1})); // expert down (q5_0)
++        test_cases.emplace_back(new test_mul_mat(Q, F, 10240, 1,  2560, {1,1}, {1,1})); // GDN wqkv
++        test_cases.emplace_back(new test_mul_mat(Q, F,  6144, 1,  2560, {1,1}, {1,1})); // GDN z gate
++        test_cases.emplace_back(new test_mul_mat(Q, F,    48, 1,  2560, {1,1}, {1,1})); // GDN beta/alpha
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, F, 248320, 1, 2560, {1,1}, {1,1})); // lm_head (q6_K)
++        test_cases.emplace_back(new test_mul_mat(F, F,   320, 1, 10240, {1,1}, {1,1})); // HC down
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_0, F, 10240, 1, 320, {1,1}, {1,1})); // HC up (q5_0)
++        test_cases.emplace_back(new test_mul_mat(F, F,     4, 1, 10240, {1,1}, {1,1})); // HC inject
++        test_cases.emplace_back(new test_mul_mat_id(Q, F, 512, 10, false, 1280, 1, 2560)); // expert gate_up x10
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, F, 512, 10, false, 2560, 1, 640)); // expert down x10
++        test_cases.emplace_back(new test_rms_norm(F, { 2560, 1, 1, 1}));
++        test_cases.emplace_back(new test_rms_norm(F, {10240, 1, 1, 1}));
++        test_cases.emplace_back(new test_ssm_scan(F, 128, 128, 48, 16, 1, 1));
++        test_cases.emplace_back(new test_ssm_conv(F, {4, 10240, 1, 1}, {4, 10240, 1, 1})); // [ncs=4, channels=10240] real layout
++        test_cases.emplace_back(new test_gated_delta_net(F, 48, 128, 1, 1, 1, false, false, 2)); // qwen4exp GDN decode
++        test_cases.emplace_back(new test_gated_delta_net(F, 48, 128, 3, 1, 1, false, false, 2)); // verify shape
++        // multi-token (verify-path) shapes for the ext matvec sweep
++        for (int64_t n : {2, 3, 4, 8}) {
++            test_cases.emplace_back(new test_mul_mat(Q, F, 12288, n,  2560, {1,1}, {1,1}));
++            test_cases.emplace_back(new test_mul_mat(Q, F,   640, n,  2560, {1,1}, {1,1}));
++            test_cases.emplace_back(new test_mul_mat(Q, F, 10240, n,  2560, {1,1}, {1,1}));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, F, 248320, n, 2560, {1,1}, {1,1}));
++        }
++    }
++
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+         for (int64_t n_tokens : {512, 2048}) {
+             test_cases.emplace_back(new test_glu(GGML_GLU_OP_SWIGLU, type, { 2*17408, n_tokens, 1, 1 }, 0, false));
+             test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SWIGLU, type, { 17408, n_tokens, 1, 1 }, 0));
+         }
+     }
