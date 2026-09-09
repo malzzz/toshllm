@@ -112,6 +112,13 @@ below):
   E2E: 22.9 -> 23.4 t/s baseline, MTP verify wall 59.2 -> 50.0 ms.
   Correctness: full GATED_DELTA_NET + new K=2 cases pass, E2E byte-identical.
   Upstream PR candidate.
+- `0061-metal-fa-wg256-gate.patch` — ggml-metal-ops.cpp: suppress the wg32
+  KV-split + separate reduce pass at simd_width==64 && dk==256 && heads>=8
+  (3x slower than the plain walk at the qwen4exp QSA shape in harness;
+  e2e-neutral). Adds TOSH_FA_WG_NB_MAX test knob. Also records: the
+  TOSH_FA_AMD_NSG_WIDE env knobs are invalid-work generators (dispatch nsg
+  must match the template-baked NSG). Fork-local hygiene; revisit for
+  upstream only with in-model evidence.
 
 Dropped across the v0.86/v0.86.1/v0.87 syncs:
 
