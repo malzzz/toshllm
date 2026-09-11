@@ -3,6 +3,38 @@
 All notable changes to ToshLLM are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.87.1] - 2026-09-11
+
+### Added
+
+- **Chat: MCP servers that run on your own machine.** Until now a server had to be reachable at a URL, which left out nearly every local one, since they are started by a command and talked to over their pipes. Settings also takes the `mcpServers` block other MCP clients use, so a configuration can be pasted in rather than retyped.
+
+### Improved
+
+- **The interface has been redesigned across every screen, with the same controls as before.** Idle memory use drops from about 600 MB to about 120 MB.
+
+- **Models in subfolders are found.** One recursive inventory now serves language, image and video models alike, so a library sorted into folders no longer looks half empty.
+
+- **The estimated speed matches your card.** It was calculated from a single card's bandwidth, and how much of that decode reaches turns out to differ by a factor of nearly three between families: measured 58.8 tokens per second on a Radeon Pro Vega II Duo against 61 on an RX 6700 XT with the same 8B model, despite 2.7 times the bandwidth. On a Radeon RX 570 the figure was out by four times.
+
+- **Text and number fields respond immediately.** A keystroke no longer rebuilds the whole screen, and numeric fields reject anything that is not a number.
+
+- **LLMs: GCN cards verify speculation up to a third faster.** With a 27B model and its DFlash2 draft, generation goes from 15.5 to 20.9 tokens per second; how much it gains depends on the prompt. Reading a prompt and plain generation are unchanged. Contributed by [malzzz](https://github.com/malzzz) in [#94](https://github.com/engeldlgado/toshllm/pull/94).
+
+### Fixed
+
+- **A DFlash/DFlash2 draft works with a model split across cards by tensors instead of taking the engine down.** The output head is now kept whole on each card for that pairing, which costs its size per card and nothing in any other configuration. On four cards it turns out to be the fastest arrangement of the three: a 27B generates 20.5 tokens per second against 14.6 splitting by layers, accepting the same drafts on a Radeon Pro Vega II Duo.
+
+- **Attention no longer crashes on 384- and 640-wide heads.** Outside TurboQuant they had no kernel, and the engine reached for it anyway. They now fall back to the processor. Contributed by [malzzz](https://github.com/malzzz) in [#96](https://github.com/engeldlgado/toshllm/pull/96).
+
+- **The engine builds again with its expert cache compiled out.** Contributed by [malzzz](https://github.com/malzzz) in [#95](https://github.com/engeldlgado/toshllm/pull/95).
+
+- **LLMs: Radeon RX 400/500, Radeon Pro 400/500 and Radeon Pro WX write text again instead of nonsense.** Since 0.87.0 the engine read the weights from addresses those cards need aligned, so half of them came back as neighbouring data. Every other card keeps the code and the speed it had. Reported by [FreQRiDeR](https://www.reddit.com/user/FreQRiDeR/).
+
+- **Chat: a model that writes its tool calls in the wrong shape no longer kills the turn.** The engine answered with an error and the message was lost, on every tool and every attempt. Such a model stops being offered tools and says so once; Settings lists them under Tools and gives each one back with a click.
+
+- **Images: LoRAs apply to f16 models instead of ending the render with an error.** Adding one to a checkpoint whose weights are f16, an SDXL safetensors file among them, stopped generation on cards without unified memory. Reported in #93.
+
 ## [0.87.0] - 2026-09-07
 
 ### Improved

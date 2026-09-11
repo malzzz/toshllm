@@ -24,7 +24,7 @@ elif [ -z "$CI" ] && [ "$TOSH_NO_BUMP" != "1" ]; then
 else
     VERSION=$(<VERSION)
 fi
-sed -i '' -E "s/static let version = \"[^\"]*\"/static let version = \"$VERSION\"/" Sources/AboutTab.swift
+sed -i '' -E "s/static let version = \"[^\"]*\"/static let version = \"$VERSION\"/" Sources/App/AboutTab.swift
 echo "version: $VERSION"
 
 # Stamp the no-AVX2 variant so the updater keeps it on its own channel (an AVX2 DMG
@@ -109,8 +109,16 @@ if ls Assets/lang/*.json >/dev/null 2>&1; then
     done
 fi
 
+# Local provider icons: no network requests while rendering the UI.
+mkdir -p "$APP/Contents/Resources/model-icons"
+cp Assets/model-icons/*.webp Assets/model-icons/sources.json "$APP/Contents/Resources/model-icons/"
+
 # Binance Pay QR (cropped) for the donations popup
 [ -f Assets/binance-qr.png ] && cp Assets/binance-qr.png "$APP/Contents/Resources/binance-qr.png"
+[ -f Assets/model-hero.jpg ] && cp Assets/model-hero.jpg "$APP/Contents/Resources/model-hero.jpg"
+[ -f Assets/model-hero-light.jpg ] && cp Assets/model-hero-light.jpg "$APP/Contents/Resources/model-hero-light.jpg"
+[ -f Assets/settings-guide.jpg ] && cp Assets/settings-guide.jpg "$APP/Contents/Resources/settings-guide.jpg"
+[ -f Assets/settings-guide-light.jpg ] && cp Assets/settings-guide-light.jpg "$APP/Contents/Resources/settings-guide-light.jpg"
 
 
 # Image generation engine (stable-diffusion.cpp; optional)
