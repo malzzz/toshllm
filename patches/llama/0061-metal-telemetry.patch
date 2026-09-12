@@ -32,7 +32,7 @@ index 969ba8c16..9f2bbfcdd 100644
  set(METALLIB_KERNELS_DEQUANTIZE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/dequantize.h")
  set(METALLIB_KERNELS_QUANTIZE   "${CMAKE_CURRENT_SOURCE_DIR}/kernels/quantize.h")
 diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
-index af5c76778..635fc3680 100644
+index 542985dc8..4eef1042a 100644
 --- a/ggml/src/ggml-metal/ggml-metal-context.m
 +++ b/ggml/src/ggml-metal/ggml-metal-context.m
 @@ -10,16 +10,41 @@
@@ -77,7 +77,7 @@ index af5c76778..635fc3680 100644
  // max number of MTLCommandBuffer used to submit a graph for processing
  #define GGML_METAL_MAX_COMMAND_BUFFERS 8
  #define GGML_METAL_MAX_PENDING_WAITS   8
-@@ -364,16 +389,19 @@ static bool ggml_metal_defer_waits(void) {
+@@ -366,16 +391,19 @@ static bool ggml_metal_defer_waits(void) {
  static void ggml_metal_encode_pending_waits(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf) {
      for (int i = 0; i < ctx->n_ev_wait_pending; ++i) {
          ggml_metal_event_encode_wait(ctx->ev_wait_pending[i], (ggml_metal_cmd_buf_t) cmd_buf);
@@ -97,7 +97,7 @@ index af5c76778..635fc3680 100644
      [cmd_buf commit];
      [ctx->cmd_bufs_ext addObject:cmd_buf];
      ctx->cmd_buf_last = cmd_buf;
-@@ -435,16 +463,19 @@ static void ggml_metal_peer_wait_add(ggml_metal_t ctx, id<MTLSharedEvent> ev, ui
+@@ -437,16 +465,19 @@ static void ggml_metal_peer_wait_add(ggml_metal_t ctx, id<MTLSharedEvent> ev, ui
          ctx->n_peer_waits++;
          return;
      }
@@ -117,7 +117,7 @@ index af5c76778..635fc3680 100644
      GGML_LOG_INFO("%s: allocating\n", __func__);
  
      @autoreleasepool {
-@@ -812,16 +843,19 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor,
+@@ -819,16 +850,19 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor,
                      offs_src = 0;
                  }
              }
@@ -137,7 +137,7 @@ index af5c76778..635fc3680 100644
                                     size:size];
  
                  [encoder endEncoding];
-@@ -839,32 +873,38 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor,
+@@ -846,32 +880,38 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor,
              }
          }
  
@@ -176,7 +176,7 @@ index af5c76778..635fc3680 100644
                             size:size];
  
          [encoder endEncoding];
-@@ -900,32 +940,38 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
+@@ -907,32 +947,38 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
  
          bid_src.offs += offset;
  
@@ -215,7 +215,7 @@ index af5c76778..635fc3680 100644
                                 size:size];
  
              [encoder endEncoding];
-@@ -967,16 +1013,19 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
+@@ -974,16 +1020,19 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
          for (size_t done = 0; done < size;) {
              const size_t n = MIN(stage_size, size - done);
  
@@ -235,7 +235,7 @@ index af5c76778..635fc3680 100644
                                     size:n];
  
                  [encoder endEncoding];
-@@ -1126,29 +1175,41 @@ static bool ggml_metal_cpy_xdev_peer(ggml_metal_t ctx_src, ggml_metal_t ctx_dst,
+@@ -1139,29 +1188,41 @@ static bool ggml_metal_cpy_xdev_peer(ggml_metal_t ctx_src, ggml_metal_t ctx_dst,
              }
          }
  
@@ -277,7 +277,7 @@ index af5c76778..635fc3680 100644
  
          ggml_metal_peer_wait_add(ctx_src, link->ev_done, seq);
  
-@@ -1220,31 +1281,49 @@ static bool ggml_metal_cpy_xdev_events(ggml_metal_t ctx_src, ggml_metal_t ctx_ds
+@@ -1233,31 +1294,49 @@ static bool ggml_metal_cpy_xdev_events(ggml_metal_t ctx_src, ggml_metal_t ctx_ds
  
      const uint64_t seq = ++link->seq;
  
@@ -327,7 +327,7 @@ index af5c76778..635fc3680 100644
      return true;
  }
  
-@@ -1331,16 +1410,19 @@ bool ggml_metal_cpy_tensor_async_ex(ggml_metal_t ctx_src, ggml_metal_t ctx_dst,
+@@ -1344,16 +1423,19 @@ bool ggml_metal_cpy_tensor_async_ex(ggml_metal_t ctx_src, ggml_metal_t ctx_dst,
          }
  
          // queue the copy operation into the Metal context
@@ -347,7 +347,7 @@ index af5c76778..635fc3680 100644
                             size:ggml_nbytes(src)];
  
          [encoder endEncoding];
-@@ -2253,16 +2335,22 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+@@ -2268,16 +2350,22 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
          const char * v = getenv("TOSH_N_MAIN");
          n_main_env = v ? atoi(v) : -1;
      }
@@ -370,7 +370,7 @@ index af5c76778..635fc3680 100644
      // while these nodes are processing, we start n_cb threads to enqueue the rest of the nodes
      // each thread creates it's own command buffer and enqueues the ops in parallel
      //
-@@ -2406,46 +2494,61 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+@@ -2421,46 +2509,61 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
  
                  MTLCommandBufferStatus status = [cmd_buf status];
                  if (status != MTLCommandBufferStatusCompleted) {
@@ -432,7 +432,7 @@ index af5c76778..635fc3680 100644
  
              [ctx->capture_scope endScope];
              [[MTLCaptureManager sharedCaptureManager] stopCapture];
-@@ -2458,16 +2561,21 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+@@ -2473,16 +2576,21 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
          atomic_fetch_add_explicit(&cbp->bucket->enc_ns,
                  clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - cbp_t0, memory_order_relaxed);
          // drop the reference held while encoding; the last completion handler frees it
@@ -454,7 +454,7 @@ index af5c76778..635fc3680 100644
  static bool ggml_metal_graph_is_moe_decode(const struct ggml_cgraph * gf, int max_tokens) {
      bool has_experts = false;
  
-@@ -2578,16 +2686,26 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+@@ -2593,16 +2701,26 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
  
          if (cb_idx < n_cb_l) {
              idx_start = n_nodes_0 + (                                         (cb_idx + 0) * n_nodes_per_cb);
@@ -481,7 +481,7 @@ index af5c76778..635fc3680 100644
              idx_end,
              ctx->use_fusion,
              ctx->use_concurrency,
-@@ -2604,19 +2722,36 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+@@ -2619,19 +2737,36 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
                  break;
              }
  
@@ -879,10 +879,10 @@ index 000000000..21fc7477d
 +#endif
 diff --git a/ggml/src/ggml-metal/ggml-metal-telemetry.m b/ggml/src/ggml-metal/ggml-metal-telemetry.m
 new file mode 100644
-index 000000000..07ff346e4
+index 000000000..69510076f
 --- /dev/null
 +++ b/ggml/src/ggml-metal/ggml-metal-telemetry.m
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,364 @@
 +//
 +// ggml-metal-telemetry.m — ObjC glue for the tosh-telemetry staticlib.
 +// Added by patches/llama/metal/0055-telemetry.patch; compiled only with
@@ -1189,9 +1189,16 @@ index 000000000..07ff346e4
 +
 +void tosh_tele_objc_csb_sample(void * encoder_raw, void * csb_raw, uint32_t sample_idx) {
 +    id<MTLComputeCommandEncoder> enc = (id<MTLComputeCommandEncoder>) encoder_raw;
++    // TOSH_TELE_BARRIER=1: sample only after all prior work drains - windows become true
++    // per-dispatch execution times (no pipeline smear), at the cost of serializing the
++    // encoder. Attribution runs only; default NO keeps production overhead low.
++    static int barrier = -1;
++    if (barrier < 0) {
++        barrier = getenv("TOSH_TELE_BARRIER") != NULL;
++    }
 +    [enc sampleCountersInBuffer:(id<MTLCounterSampleBuffer>) csb_raw
 +                   atSampleIndex:sample_idx
-+                     withBarrier:NO];
++                     withBarrier:(BOOL) barrier];
 +}
 +
 +// allocate the next boundary index for this CB (serial via serial_out)

@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
-index c368de8fe..cb53ecdd7 100644
+index c368de8fe6329d55e31377104dcf6642ce54a75d..cb53ecdd7bdbf51939fa2b1bc5955ed695f18cdd 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
 @@ -664,16 +664,34 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan(ggml_me
@@ -86,7 +86,7 @@ index c368de8fe..cb53ecdd7 100644
      res.nsg = nsg;
  
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
-index dab867550..e9299242e 100644
+index dab8675500ca8d02001718f1e95a3c34396afd78..e9299242e156dce4c30a1be862af8e62b947fce3 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.h
 +++ b/ggml/src/ggml-metal/ggml-metal-device.h
 @@ -129,19 +129,20 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cumsum_ad
@@ -112,7 +112,7 @@ index dab867550..e9299242e 100644
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
-index 1853e4960..05d22867e 100644
+index 1853e4960c65b115a7a52d91254592ede7431f5d..05d22867ec32982cdd45442f71c98528e0a2dba8 100644
 --- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
 @@ -2020,16 +2020,23 @@ int ggml_metal_op_ssm_scan(ggml_metal_op_t ctx, int idx) {
@@ -175,7 +175,7 @@ index 1853e4960..05d22867e 100644
          /*.ne02 =*/ ne02,
          /*.ne03 =*/ ne03,
 diff --git a/ggml/src/ggml-metal/kernels/gated_delta_net.metal b/ggml/src/ggml-metal/kernels/gated_delta_net.metal
-index 98fa33860..8167a5c74 100644
+index 98fa338600fac6257b6defcd3ba2a15d791b4f12..8167a5c74340e504e82006c8b7ea1b04547127ca 100644
 --- a/ggml/src/ggml-metal/kernels/gated_delta_net.metal
 +++ b/ggml/src/ggml-metal/kernels/gated_delta_net.metal
 @@ -1,13 +1,17 @@
@@ -347,7 +347,7 @@ index 98fa33860..8167a5c74 100644
  }
  
 diff --git a/ggml/src/ggml-metal/kernels/ssm.metal b/ggml/src/ggml-metal/kernels/ssm.metal
-index 6fff5b34c..badca02d4 100644
+index 6fff5b34c27c30d8e744d3d02023cc1cb463bb15..badca02d40126ca19322a51cef87698793eefb5d 100644
 --- a/ggml/src/ggml-metal/kernels/ssm.metal
 +++ b/ggml/src/ggml-metal/kernels/ssm.metal
 @@ -419,16 +419,77 @@ kernel void kernel_ssm_scan_impl(
@@ -429,7 +429,7 @@ index 6fff5b34c..badca02d4 100644
          device const void * src1,
          device const void * src2,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index c7f2cad03..b48405a08 100644
+index c7f2cad0369f8e10097fc90ca730eb6187a1f1e0..7a5ba6d6f75c8ddbf3feca7c5f8cac515472e796 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -4489,26 +4489,27 @@ struct test_gated_delta_net : public test_case {
@@ -444,7 +444,8 @@ index c7f2cad03..b48405a08 100644
 +    const bool      misalign; // state view shifted +4B off the 16B vector boundary
  
      std::string vars() override {
-         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
+-        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
++        return VARS_TO_STR10(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, misalign);
      }
  
      test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
@@ -490,7 +491,7 @@ index c7f2cad03..b48405a08 100644
          k = ggml_l2_norm(ctx, k, 1e-6f);
          ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
          return out;
-@@ -8687,16 +8697,30 @@ static const ggml_type other_types[] = {
+@@ -8687,16 +8697,43 @@ static const ggml_type other_types[] = {
  #ifdef _MSC_VER
  // Workaround long compile time with msvc
  #pragma optimize("", off)
@@ -500,18 +501,31 @@ index c7f2cad03..b48405a08 100644
  static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      std::vector<std::unique_ptr<test_case>> test_cases;
 +
-+    // qwen4exp GDN decode shapes: exercise kernel_ssm_scan_f32_dec (wave64, n_t=1, d_state=128)
-+    if (getenv("QWEN4EXP_PERF") != nullptr) {
++    // Decode coverage is part of ordinary correctness evaluation, not a perf-only opt-in.
++    {
 +        test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 128, 48, 16, 1, 1));
 +        test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 128, 48, 16, 1, 2));  // two seqs
 +        test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 128, 48, 16, 3, 1));  // multi-token: generic path
++        test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128,   1, 48, 16, 1, 1)); // vector A
++        test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128,   1, 48, 16, 1, 2));
++        test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 128, 48, 16, 1, 1, false, /*K=*/2));
++        test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 128, 48, 16, 1, 2, false, /*K=*/2));
++    }
++    if (getenv("QWEN4EXP_PERF") != nullptr) {
 +        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4, 10240, 1, 1}, {4, 10240, 1, 1}));
++    }
++    {
 +        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, 1, 1, false, false, 2)); // K=2 snapshots
-+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, 1, 1, true,  false, 2)); // K=2 + kda
++        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, 1, 1, true,  false, 2)); // K=2 + permuted
 +        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 3, 1, 1, false, false, 2)); // K=2 multi-token
 +        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 2, 2, 1, false, false, 2)); // K=2 two seqs
 +        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, 1, 1, false, false, 2, true)); // misaligned state
 +        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, 1, 1, false, true,  2, true)); // misaligned + kda
++        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, 1, 1, false, true,  2)); // K=2 + KDA
++        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 3, 1, 1, false, true,  2));
++        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 2, 2, 1, false, true,  2));
++        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 3, 2, 2, true, true, 2));
++        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1, 1, 1, false, true, 1));
 +    }
      std::default_random_engine rng(0);
  
@@ -521,7 +535,7 @@ index c7f2cad03..b48405a08 100644
              for (int op = 0; op < GGML_UNARY_OP_COUNT; op++) {
                  if (op == GGML_UNARY_OP_XIELU) {
                      continue; // need extra params, separate test
-@@ -10448,16 +10472,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10448,16 +10485,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
  
@@ -561,7 +575,7 @@ index c7f2cad03..b48405a08 100644
      test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2304));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
      test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
-@@ -10750,16 +10797,48 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10750,16 +10810,48 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  #ifdef _MSC_VER
  #pragma optimize("", on)
  #endif

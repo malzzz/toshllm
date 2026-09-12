@@ -9,7 +9,39 @@ This branch (`telemetry`, tracks `upstream/main`) carries the MXP telemetry
 instrumentation plus our not-yet-upstream fixes for the vendored llama.cpp
 engine.
 
-## Series layout (v0.87.1)
+## Series layout (v0.87.3)
+
+The v0.87.3 sync merges upstream `9a6c16c` and retains llama.cpp pin
+`465e49b9cea78a68b9c244ffb48d0ee24a82873d`. Upstream now owns patches
+0058 (wave64 sparse-attention indices) and 0059 (fused-exchange event
+separation). Our tail moves to 0060-0068; historical experiment/report IDs
+still use their original numbers.
+
+| v0.87.1 number | v0.87.3 number | Custom patch |
+| --- | --- | --- |
+| 0058 | 0060 | Queue depth |
+| 0059 | 0061 | Metal telemetry |
+| 0060 | 0062 | CUDA telemetry |
+| 0061 | 0063 | Qwen4exp MTP |
+| 0062 | 0064 | Linux meta threads |
+| 0063 | 0065 | Exchange staging buffers and allocation checks |
+| 0064 | 0066 | Speculative timing |
+| 0065 | 0067 | Wave64 GDN/SSM and existing test repairs |
+| 0066 | 0068 | FA wg256 gate |
+
+The original exchange-channel patch WAS included in the Stage 0 v8 baseline.
+The later cached/fail-stop 0063 candidate was held separately; it remains
+excluded, as do the later GDN/MTP optimization candidates. Upstream's 0059
+therefore does not add a previously missing event fix to our baseline. The
+residual custom patch preserves separate staging buffers and checks/releases
+all four event objects. Its final context source remains byte-identical to
+the pre-upgrade fork. Only the three sparse-attention files change in the
+fully applied engine tree, apart from excluded local build artifacts.
+
+The existing Metal barrier-glue edit and GDN/SSM test repairs are preserved
+from both development checkouts. They are not newly promoted optimization
+candidates. Frozen Stage 0 v8 sources, libraries and replay binaries are not
+replaced; v0.87.3 compatibility is tested under a separate experiment ID.
 
 v0.86 collapsed upstream's ~65 area-dir patches into **7 monolithic patches
 in a flat layout** (`patches/llama/0001-metal-kernels.patch` …
@@ -22,9 +54,10 @@ experimental-moe` dirs are gone). v0.87.0 runs the flat series 0001-0048
 matvecs are in `kernels/mul_mv_w64.metal`.
 
 The v0.87.1 sync merges upstream `6c18507` and keeps that llama.cpp pin.
-Upstream's series now runs through 0057; gaps at 0049, 0052 and 0053 are
-normal. Our nine surviving patches follow it as 0058-0066, preserving their
-relative order. Upstream owns its original patch names and numbers.
+At that release upstream's series ran through 0057; gaps at 0049, 0052 and
+0053 are normal. Our nine surviving patches followed as 0058-0066. The
+v0.87.3 mapping above preserves their relative order. Upstream owns its
+original patch names and numbers.
 
 v0.86.1 folded our upstreamed fixes into the flat series (PRs #77-80, all
 closed/merged):
@@ -57,15 +90,15 @@ splits in 0057. None supersedes the remaining local changes below.
 
 What remains ours, at the series tail (old numbers refer to v0.87.0):
 
-- `0058-metal-queue-depth-scale.patch` (was 0049) — scale MTL queue depth with the
+- `0060-metal-queue-depth-scale.patch` (was 0049) — scale MTL queue depth with the
   registered device count. **FORK-LOCAL**: the maintainer's bar was a
   measured reproducible case of the 64-buffer limit backpressuring; we ran
   the measurement and it is a **clean negative** (recorded in
   model-experiments `vega-duo-diag/queue-depth-backpressure.md`). The patch
   stays as harmless insurance for the 4-die rig — do not PR it.
-- `0059-metal-telemetry.patch` (was 0052) — ggml-metal telemetry glue.
-- `0060-cuda-telemetry.patch` (was 0053) — ggml-cuda telemetry glue.
-- `0061-qwen4exp-mtp.patch` (was 0056) — MTP/NextN draft-head support for qwen4exp
+- `0061-metal-telemetry.patch` (was 0052) — ggml-metal telemetry glue.
+- `0062-cuda-telemetry.patch` (was 0053) — ggml-cuda telemetry glue.
+- `0063-qwen4exp-mtp.patch` (was 0056) — MTP/NextN draft-head support for qwen4exp
   (Qwen3.8-Flash-Next): five `blk.N.nextn.*` tensor types (fc_embedding,
   fc_hidden, hc_mix_norm/down/up), mtp_only/load_mtp wiring in
   `qwen4exp.cpp::load_arch_tensors`, conditional last-layer row drop +
@@ -77,14 +110,17 @@ What remains ours, at the series tail (old numbers refer to v0.87.0):
   export + gguf-py tensor map entries. Semantics pinned from vLLM
   `qwen4_exp/nvidia/mtp.py` (only public MTP implementation; HF transformers
   ignores ^mtp.*). Measured on the rig with a hand-built mtp-only draft
-  GGUF (MXP `scripts/make-qwen4exp-mtp-gguf.py`): engages, 54.2% acceptance,
-  correct output. Upstream PR candidate (large; coordinate with maintainer).
-- `0062-linux-meta-threads.patch` (was 0057) — ggml-backend-meta: std::thread twin of
+  GGUF (MXP `scripts/make-qwen4exp-mtp-gguf.py`): historical smoke showed
+  engagement and 54.2% acceptance. The v0.87.1 review found recurrent
+  rollback/replay failures; longer repeated requests also fail token parity
+  without the cap-fix candidate. Broad correctness and performance qualification
+  remain open. Upstream PR candidate (large; coordinate with maintainer).
+- `0064-linux-meta-threads.patch` (was 0057) — ggml-backend-meta: std::thread twin of
   the Apple GCD multi-backend subgraph dispatch. Captures a long-standing
   in-tree edit from the Linux bring-up that was never in the series (the
   v0.87 round-trip diff caught it). FORK-LOCAL: Linux-only, upstream is
   macOS+AMD.
-- `0063-metal-xdev-exchange-channel.patch` (was 0058) — ggml-metal-context.m: the fused
+- `0065-metal-xdev-exchange-channel.patch` (was 0058) — ggml-metal-context.m: the fused
   butterfly exchange (`ggml_metal_exchange_reduce`) shared the `xdev_link`
   seq counter, ready/done events, and host wrap buffers with the unfused
   cpy_xdev_events/peer copy paths. Runs mixing both schemes on one link
@@ -96,19 +132,23 @@ What remains ours, at the series tail (old numbers refer to v0.87.0):
   control, and 2-die tensor 105.3 -> 116.9 t/s (the collision was stalling
   it too). Note: `-sm tensor` is the ToshLLM app default, so this bit every
   multi-die AMD user. Upstream PR candidate (strong).
-- `0064-spec-timing-instrumentation.patch` (was 0059) — TOSH_SPEC_TIMING phase timers in
+- `0066-spec-timing-instrumentation.patch` (was 0059) — TOSH_SPEC_TIMING phase timers in
   the speculative-simple example (draft/ckpt/verify/process/accept per-round
   breakdown). FORK-LOCAL: profiling tool, not for upstream.
-- `0065-metal-gdn-wave64.patch` (was 0060) — gated_delta_net float4 state IO under
-  NSG==4 (2.83x decode / 4.13x verify at qwen4exp shapes, 700 GB/s ~= the
-  practical HBM ceiling), plus new kernel_ssm_scan_f32_dec wave64 decode
+- `0067-metal-gdn-wave64.patch` (was 0060) — gated_delta_net float4 state IO under
+  NSG==4 (historically 2.83x decode / 4.13x verify at qwen4exp shapes), plus
+  new kernel_ssm_scan_f32_dec wave64 decode
   variant (2.78x, mamba-family; fires only at n_seq_tokens==1 &&
   simd_width==64 && d_state==2*simd_width). Note: the in-model GDN op is
   gated_delta_net, not ssm_scan/conv — verified via dispatch telemetry.
-  E2E: 22.9 -> 23.4 t/s baseline, MTP verify wall 59.2 -> 50.0 ms.
-  Correctness: full GATED_DELTA_NET + new K=2 cases pass, E2E byte-identical.
+  Historical E2E: 22.9 -> 23.4 t/s baseline, MTP verify wall 59.2 -> 50.0 ms.
+  The harness's allocated-tensor byte estimate is not measured HBM bandwidth
+  and does not establish a bandwidth ceiling. Ordinary evaluation now includes
+  SSM decode and aligned KDA coverage, corrected permutation labeling, and
+  distinct misalignment identities: 61 supported CPU-reference cases pass on
+  each of the four Vega GPUs (six width-16 GDN cases are unsupported).
   Upstream PR candidate.
-- `0066-metal-fa-wg256-gate.patch` (was 0061) — ggml-metal-ops.cpp: suppress the wg32
+- `0068-metal-fa-wg256-gate.patch` (was 0061) — ggml-metal-ops.cpp: suppress the wg32
   KV-split + separate reduce pass at simd_width==64 && dk==256 && heads>=8
   (3x slower than the plain walk at the qwen4exp QSA shape in harness;
   e2e-neutral). Adds TOSH_FA_WG_NB_MAX test knob. Also records: the
@@ -144,7 +184,9 @@ compile to nothing; with `TOSH_TELEMETRY` unset at runtime they are inert.
 The Linux checkout is `/data/alchemical-rabbit/libs/toshllm`. On the Mac
 Pro, use `~/toshllm-exp/toshllm`; its `vendor/llama.cpp` symlink points to
 `../../vendor-86`, preserving the existing experiment and build paths.
-Both checkouts carry the same v0.87.1 custom series. The Mac-only
+Use the v0.87.3 custom series for both development checkouts. Preserve the
+pre-upgrade vendor trees and dirty files in upgrade backups before switching.
+The Mac-only
 `test-backend-ops.cpp` diagnostic overlay stays local and is excluded from
 the canonical patch series. Preserve it separately when replacing or
 reconstructing the Mac vendor tree.
@@ -157,10 +199,10 @@ The telemetry glue sources and patchers live in the MXP repo at
 - patchers: `scripts/apply-telemetry-edits.py` (metal),
   `scripts/apply-telemetry-edits-cuda.py` (cuda)
 - regenerators: `scripts/regen-metal-telemetry.sh` (metal, default number
-  0059), `scripts/regen-cuda-telemetry.sh` (cuda, default number 0060)
+  0061), `scripts/regen-cuda-telemetry.sh` (cuda, default number 0062)
 
 Never hand-edit the telemetry patch files here; change the glue or patcher
-in MXP and regenerate. (The non-telemetry patches 0058 and 0061-0066 are hand-carried
+in MXP and regenerate. (The non-telemetry patches 0060 and 0063-0068 are hand-carried
 — re-diff them per sync, below.)
 
 ## Regenerating the telemetry patches
@@ -175,16 +217,25 @@ git -C vendor/llama.cpp checkout "$LLAMA_COMMIT"
 ```
 
 The regen scripts use version-scoped throwaway clones
-`/tmp/llama-tele-v0.87.1` and `/tmp/llama-tele-cuda-v0.87.1` (bootstrapped on
+`/tmp/llama-tele-v0.87.3` and `/tmp/llama-tele-cuda-v0.87.3` (bootstrapped on
 first run), regenerate into the flat `patches/llama/`, and re-apply to the
 vendor tree. Set `TC` to a fresh path whenever the pin or preceding patches
 change; an existing cached base is not rebuilt automatically.
 
+The live MXP Metal glue now belongs to the separate Stage 0 causal overlay
+and imports `ggml-metal-causal.h`; it must not be inserted into this ordinary
+fork patch alone. The Metal regenerator refuses that input before changing
+anything. For this sync, `TELE` points to a preserved copy of the pre-upgrade
+fork's `ggml-metal-telemetry.h` and `.m` (including the existing barrier knob).
+Preserve that pair outside the disposable vendor before starting regeneration.
+The Stage 0 experiment separately applies its frozen causal overlay and glue;
+this upgrade does not promote that instrument into the canonical patch series.
+
 The vendor tree must be at the corresponding series position when each
 script runs, with no local edits in the files it restores. Running Metal
 regen on a fully patched vendor tree would discard later changes in those
-files, including the exchange-channel fix. Metal telemetry 0059 diffs
-against the pin plus every patch below 0059; CUDA telemetry 0060 diffs
+files, including the exchange-channel fix. Metal telemetry 0061 diffs
+against the pin plus every patch below 0061; CUDA telemetry 0062 diffs
 against the pristine pin because no other patch touches ggml-cuda.
 Sequence on Linux, starting with a clean disposable vendor checkout at
 the pin:
@@ -194,22 +245,22 @@ MXP=/data/alchemical-rabbit/model-experiments
 export FORK=/path/to/disposable/toshllm
 cd "$FORK/vendor/llama.cpp"
 
-# 1. upstream's patches through 0057, then our queue-depth patch 0058
+# 1. upstream's patches through 0059, then our queue-depth patch 0060
 find "$FORK/patches/llama" -maxdepth 1 -name '*.patch' -printf '%f\t%p\n' | sort | cut -f2- \
-  | awk -F/ '$NF < "0059"' | while read -r p; do git apply "$p"; done
+  | awk -F/ '$NF < "0061"' | while read -r p; do git apply "$p"; done
 
-# 2. metal telemetry (regenerates + applies 0059)
-$MXP/scripts/regen-metal-telemetry.sh
+# 2. metal telemetry (regenerates + applies 0061); use preserved fork glue
+TELE=/path/to/preserved-fork-metal-glue $MXP/scripts/regen-metal-telemetry.sh
 
-# 3. cuda telemetry (regenerates + applies 0060)
+# 3. cuda telemetry (regenerates + applies 0062)
 $MXP/scripts/regen-cuda-telemetry.sh
 
-# 4. the remaining custom patches 0061-0066
+# 4. the remaining custom patches 0063-0068
 find "$FORK/patches/llama" -maxdepth 1 -name '*.patch' -printf '%f\t%p\n' | sort | cut -f2- \
-  | awk -F/ '$NF >= "0061"' | while read -r p; do git apply "$p"; done
+  | awk -F/ '$NF >= "0063"' | while read -r p; do git apply "$p"; done
 ```
 
-## Re-diffing the hand-carried patches (0058, 0061-0066) on a sync
+## Re-diffing the hand-carried patches (0060, 0063-0068) on a sync
 
 When upstream moves the pin or the monoliths, our non-telemetry patches must
 be re-created against the monolith-applied tree. The procedure used for the
@@ -258,7 +309,7 @@ git merge upstream/main
 Preserve existing edits before merging, and use an isolated worktree for
 patch reconciliation. Upstream may delete, restructure, or absorb patches
 we also touched. Accept upstream's layout and regenerate the surviving
-custom series with the re-diff procedure above. The v0.87.1 sync preserves
+custom series with the re-diff procedure above. The v0.87.3 sync preserves
 both histories with a merge rather than rewriting the telemetry branch.
 
 After the merge:
@@ -272,7 +323,7 @@ After the merge:
    vendor contents with the validated result.
 2. Give each regen script a fresh version-scoped `TC` path so its base is
    rebuilt against the new series; preserve the previous scratch clones.
-3. Re-diff 0058/0061-0066 (procedure above), re-run both telemetry regen
+3. Re-diff 0060/0063-0068 (procedure above), re-run both telemetry regen
    scripts, re-validate the full series.
 4. Commit the regenerated patches on this branch.
 
