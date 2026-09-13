@@ -1,0 +1,75 @@
+Experimental fork overlay: Honor MTP request caps and account for offered draft tokens
+Source: model-experiments/vega-duo-diag/fixes/2026-09-11-0065-0061/0061-shared-mtp-cap.delta.patch
+User-approved for the experimental v0.87.3 Mac application build.
+This packages retained production code, not fault injection or benchmark hooks.
+Qualification limit: Short controls passed; broader MTP state/parity and performance qualification remain unresolved.
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index d57fbff..39106ce 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1802,16 +1802,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             auto & dp = dparams[seq_id];
+ 
+             if (!dp.drafting) {
+                 continue;
+             }
+ 
++            if (dp.n_max == 0 || params.n_max <= 0) {
++                n_last_draft[seq_id] = 0;
++                continue;
++            }
++
+             // while backed off, probe every probe_gap steps and double the gap on a failed probe,
+             // so a durable cold streak decays toward AR yet a late recovery is still caught
+             if (acc_ewma[seq_id] < acc_min) {
+                 if (steps_cold[seq_id] < probe_gap[seq_id]) {
+                     n_last_draft[seq_id] = 0;
+                     steps_cold[seq_id]++;
+                     continue;
+                 }
+@@ -1898,17 +1903,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+                 common_sampler_accept(smpl, id, true);
+ 
+                 auto & dp = dparams.at(seq_id);
+                 auto & result = *dp.result;
+ 
+                 result.push_back(id);
+ 
+-                if (params.n_max <= (int) result.size()) {
++                // Keep the minimum-depth confidence check before the request cap.
++                const int32_t n_max = dp.n_max >= 0
++                        ? std::min(params.n_max, std::max(params.n_min, dp.n_max))
++                        : params.n_max;
++                if (n_max <= (int) result.size()) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+                     continue;
+                 }
+ 
+                 if (chain_heads) {
+                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448031546
+                     chain_h[seq_id].insert(chain_h[seq_id].end(), h_row, h_row + n_embd);
+@@ -1949,16 +1958,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             if (!dp.drafting) {
+                 continue;
+             }
+ 
+             if (dp.result->size() < (size_t) params.n_min) {
+                 dp.result->clear();
+             }
+             if (drafted_this_step[seq_id]) {
++                if (dp.n_max >= 0 && dp.result->size() > (size_t) dp.n_max) {
++                    dp.result->resize(dp.n_max);
++                }
+                 n_last_draft[seq_id] = (int32_t) dp.result->size();
+             }
+         }
+     }
+ 
+     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+             return;

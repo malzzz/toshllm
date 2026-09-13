@@ -14,8 +14,9 @@ engine.
 The v0.87.3 sync merges upstream `9a6c16c` and retains llama.cpp pin
 `465e49b9cea78a68b9c244ffb48d0ee24a82873d`. Upstream now owns patches
 0058 (wave64 sparse-attention indices) and 0059 (fused-exchange event
-separation). Our tail moves to 0060-0068; historical experiment/report IDs
-still use their original numbers.
+separation). Our preserved custom tail moves to 0060-0068; historical
+experiment/report IDs still use their original numbers. The user-requested
+experimental application build additionally appends 0069-0073 below.
 
 | v0.87.1 number | v0.87.3 number | Custom patch |
 | --- | --- | --- |
@@ -29,14 +30,25 @@ still use their original numbers.
 | 0065 | 0067 | Wave64 GDN/SSM and existing test repairs |
 | 0066 | 0068 | FA wg256 gate |
 
+The user has now explicitly requested that the retained experimental candidates
+be included in the installed Mac application to observe their behavior. The
+normal numeric build series therefore also includes 0069 (cached exchange
+preflight/fail-stop), 0070 (guarded GDN rows2), 0071 (GDN k-load reuse), 0072
+(MTP cap/accounting), and 0073 (Qwen4exp gather-before-HC). See
+[EXPERIMENTAL.md](EXPERIMENTAL.md) for exact source deltas, hashes, known failures
+and exclusions. Inclusion is experimental deployment authorization, not a new
+correctness or performance acceptance result.
+
 The original exchange-channel patch WAS included in the Stage 0 v8 baseline.
-The later cached/fail-stop 0063 candidate was held separately; it remains
-excluded, as do the later GDN/MTP optimization candidates. Upstream's 0059
+At the v0.87.3 compatibility checkpoint, the later cached/fail-stop 0063 and
+GDN/MTP optimization candidates were held separately and excluded. Those frozen
+controls remain unchanged by the newly requested experimental tail. Upstream's 0059
 therefore does not add a previously missing event fix to our baseline. The
 residual custom patch preserves separate staging buffers and checks/releases
 all four event objects. Its final context source remains byte-identical to
-the pre-upgrade fork. Only the three sparse-attention files change in the
-fully applied engine tree, apart from excluded local build artifacts.
+the pre-upgrade fork through 0068. In that compatibility tree, only the three
+sparse-attention files changed, apart from excluded local build artifacts;
+0069-0073 are subsequent experimental changes.
 
 The existing Metal barrier-glue edit and GDN/SSM test repairs are preserved
 from both development checkouts. They are not newly promoted optimization
@@ -202,7 +214,7 @@ The telemetry glue sources and patchers live in the MXP repo at
   0061), `scripts/regen-cuda-telemetry.sh` (cuda, default number 0062)
 
 Never hand-edit the telemetry patch files here; change the glue or patcher
-in MXP and regenerate. (The non-telemetry patches 0060 and 0063-0068 are hand-carried
+in MXP and regenerate. (The non-telemetry patches 0060 and 0063-0073 are hand-carried
 — re-diff them per sync, below.)
 
 ## Regenerating the telemetry patches

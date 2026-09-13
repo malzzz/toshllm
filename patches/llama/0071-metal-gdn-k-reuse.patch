@@ -1,0 +1,49 @@
+Experimental fork overlay: Reuse the original GDN vector k load
+Source: model-experiments/vega-duo-diag/fixes/2026-09-11-0065-0061/0065-k-reuse.delta.patch
+User-approved for the experimental v0.87.3 Mac application build.
+This packages retained production code, not fault injection or benchmark hooks.
+Qualification limit: Targeted correctness passed; performance is a small unqualified screen, and combination with guarded rows2 was not previously qualified.
+
+diff --git a/ggml/src/ggml-metal/kernels/gated_delta_net.metal b/ggml/src/ggml-metal/kernels/gated_delta_net.metal
+index 8167a5c..bbd907a 100644
+--- a/ggml/src/ggml-metal/kernels/gated_delta_net.metal
++++ b/ggml/src/ggml-metal/kernels/gated_delta_net.metal
+@@ -99,18 +99,19 @@ kernel void kernel_gated_delta_net_impl(
+         } else {
+             // KDA
+             FOR_UNROLL (short j = 0; j < NSG; j++) {
+                 const short is = tx*NSG + j;
+                 ls[j] *= exp(g_ptr[is]);
+             }
+         }
+ 
++        float4 k4;
+         if (GDN_VEC4) {
+-            const float4 k4 = *(device const float4 *) (k_ptr + tx*NSG);
++            k4 = *(device const float4 *) (k_ptr + tx*NSG);
+             FOR_UNROLL (short j = 0; j < NSG; j++) {
+                 s_k += ls[j]*k4[j];
+             }
+         } else {
+             FOR_UNROLL (short j = 0; j < NSG; j++) {
+                 const short is = tx*NSG + j;
+                 s_k += ls[j]*k_ptr[is];
+             }
+@@ -118,17 +119,16 @@ kernel void kernel_gated_delta_net_impl(
+ 
+         s_k = gdn_sum32(s_k);
+ 
+         const float d = (v_ptr[i20] - s_k)*b_ptr[0];
+ 
+         float y = 0.0f;
+ 
+         if (GDN_VEC4) {
+-            const float4 k4 = *(device const float4 *) (k_ptr + tx*NSG);
+             const float4 q4 = *(device const float4 *) (q_ptr + tx*NSG);
+             FOR_UNROLL (short j = 0; j < NSG; j++) {
+                 ls[j] += k4[j]*d;
+                 y     += ls[j]*q4[j];
+             }
+         } else {
+             FOR_UNROLL (short j = 0; j < NSG; j++) {
+                 const short is = tx*NSG + j;

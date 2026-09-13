@@ -1,0 +1,41 @@
+Experimental fork overlay: Gather target logits rows before the final Qwen4exp HC mixer
+Source: model-experiments/vega-duo-diag/fixes/2026-09-11-0065-0061/gather-delta.patch
+User-approved for the experimental v0.87.3 Mac application build.
+This packages retained production code, not fault injection or benchmark hooks.
+Qualification limit: Known finite prefill-logit drift failed exact parity; retained NextN rows and selected tokens matched in the tested case.
+
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -497,21 +497,26 @@
+         cb(res_hc, "l_last", il);
+     }
+ 
+-    // the final mixer is the output norm: there is no separate one
+-    ggml_tensor * cur = build_hc_mix(res_hc,
+-            model.hc_head_norm, model.hc_head_down, model.hc_head_up,
+-            nullptr, nullptr, -1);
+-
++    ggml_tensor * head_hc = res_hc;
+     if (cparams.embeddings_nextn) {
+         // the MTP draft consumes the wide pre-final-mixer stream, not the collapsed output
+         cb(res_hc, "h_nextn", -1);
+         res->t_h_nextn = res_hc;
+ 
+         if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+-            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++            // The mixer is per token. Gather only its logits rows while retaining
++            // the full pre-mixer stream above for every target token's MTP state.
++            head_hc = ggml_reshape_2d(ctx0, head_hc, n_embd*hc, head_hc->ne[2]);
++            head_hc = ggml_get_rows(ctx0, head_hc, inp_out_ids);
++            head_hc = ggml_reshape_3d(ctx0, head_hc, n_embd, hc, head_hc->ne[1]);
+         }
+     }
+ 
++    // the final mixer is the output norm: there is no separate one
++    ggml_tensor * cur = build_hc_mix(head_hc,
++            model.hc_head_norm, model.hc_head_down, model.hc_head_up,
++            nullptr, nullptr, -1);
++
+     cb(cur, "result_norm", -1);
+     res->t_embd = cur;
+ 

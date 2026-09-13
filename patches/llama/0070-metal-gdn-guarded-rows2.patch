@@ -1,0 +1,207 @@
+Experimental fork overlay: Shape-gated two-row GDN reuse for Vega II Duo
+Source: model-experiments/vega-duo-diag/fixes/2026-09-11-0065-0061/guard-delta.patch
+User-approved for the experimental v0.87.3 Mac application build.
+This packages retained production code, not fault injection or benchmark hooks.
+Qualification limit: Targeted correctness passed; 70/72 kernel performance gates passed and no whole-model gain was resolved.
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index cb53ecdd7bdbf51939fa2b1bc5955ed695f18cdd..a013bd670daf75fa604505cf182bdcd8e4d3babf 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -758,18 +758,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
+     const int K = ggml_get_op_params_i32(op, 0);
+ 
+     const int nsg = op->src[2]->ne[0]/32;
+ 
+     GGML_ASSERT(op->src[5]->type == GGML_TYPE_F32);
+     GGML_ASSERT(op->ne[0] == ne20 * ne21);
+     GGML_ASSERT(ne20 % 32 == 0);
+ 
+-    // the vec4 path moves 16B per lane; require it on top of wave64 (checked by the caller)
+-    snprintf(base, 256, "kernel_gated_delta_net_%s_%d", ggml_type_name(op->src[0]->type), nsg);
++    // Keep row pairing on the measured device and decode shapes; vec4 includes the caller's alignment checks.
++    const auto * props = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
++    const bool measured_device = strcmp(props->desc, "AMD Radeon Pro Vega II Duo") == 0 ||
++        strncmp(props->desc, "AMD Radeon Pro Vega II Duo (dev p", sizeof("AMD Radeon Pro Vega II Duo (dev p") - 1) == 0;
++    const bool rows2 = vec4 && props->simd_width == 64 && measured_device && ne20 == 128 &&
++        op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1 && (K == 1 || K == 2) &&
++        (ne21 == 12 || ne21 == 16 || ne21 == 32) && (ne30 == 1 || ne21 == 32);
++    snprintf(base, 256, "kernel_gated_delta_net_%s_%d%s", ggml_type_name(op->src[0]->type), nsg, rows2 ? "_rows2" : "");
+     snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d%s", base, ne20, ne30, K, vec4 ? "_v4" : "");
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+         ggml_metal_cv_t cv = ggml_metal_cv_init();
+ 
+         ggml_metal_cv_set_int16(cv, ne20, FC_GATED_DELTA_NET + 0);
+         ggml_metal_cv_set_int16(cv, ne30, FC_GATED_DELTA_NET + 1);
+@@ -777,16 +783,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
+         ggml_metal_cv_set_int16(cv, vec4 ? 1 : 0, FC_GATED_DELTA_NET + 3);
+ 
+         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+ 
+         ggml_metal_cv_free(cv);
+     }
+ 
+     res.nsg = nsg;
++    res.nr0 = rows2 ? 2 : 1; // state rows per logical 32-lane group, including cache hits
+ 
+     return res;
+ }
+ 
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_turbo_wht(ggml_metal_library_t lib) {
+     const char * name = "kernel_turbo_wht";
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 0556b4dfc8cfa5896415dc9b048f17528711dd4a..e505bf33af07eb67326dc9c8fce5d8c57f0d8e11 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2175,17 +2175,18 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), ida++); // v
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), ida++); // gate
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), ida++); // beta
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // state
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst
+ 
+     const int nsg = pipeline.nsg;
+ 
+-    ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
++    const int rows_per_thread = pipeline.nr0;
++    ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/(nsg*rows_per_thread), op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
+ 
+     return 1;
+ }
+ 
+ int ggml_metal_op_turbo_wht(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+     ggml_metal_library_t lib = ctx->lib;
+diff --git a/ggml/src/ggml-metal/kernels/gated_delta_net.metal b/ggml/src/ggml-metal/kernels/gated_delta_net.metal
+index 8167a5c74340e504e82006c8b7ea1b04547127ca..4896c97733a662198d0a3112619a130b4e9d4bc2 100644
+--- a/ggml/src/ggml-metal/kernels/gated_delta_net.metal
++++ b/ggml/src/ggml-metal/kernels/gated_delta_net.metal
+@@ -192,16 +192,123 @@ kernel void kernel_gated_delta_net_impl(
+ }
+ 
+ typedef decltype(kernel_gated_delta_net_impl<4>) kernel_gated_delta_net_t;
+ 
+ template [[host_name("kernel_gated_delta_net_f32_1")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<1>;
+ template [[host_name("kernel_gated_delta_net_f32_2")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<2>;
+ template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<4>;
+ 
++// Aligned wave64 decode: each logical 32-lane group updates two state rows.
++kernel void kernel_gated_delta_net_f32_4_rows2(
++        constant ggml_metal_kargs_gated_delta_net & args,
++        device const char * q,
++        device const char * k,
++        device const char * v,
++        device const char * g,
++        device const char * b,
++        device const char * s,
++        device       char * dst,
++        uint3 tgpig[[threadgroup_position_in_grid]],
++        uint3 tpitg[[thread_position_in_threadgroup]],
++        uint3   ntg[[threads_per_threadgroup]]) {
++#define S_v FC_gated_delta_net_ne20
++#define G   FC_gated_delta_net_ne30
++#define K   FC_gated_delta_net_K
++    const uint tx = tpitg.x;
++    const uint i23 = tgpig.z;
++    const uint i21 = tgpig.y;
++    const uint i20 = tgpig.x*8 + tpitg.y;
++    const uint i01 = i21 % args.ne01;
++    const uint i11 = i21 % args.ne11;
++    const float scale = 1.0f / sqrt((float)S_v);
++
++    const uint state_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
++    device const float * s_ptr = (device const float *) s + state_base;
++    float4 ls[2] = {
++        *(device const float4 *) (s_ptr + tx*4),
++        *(device const float4 *) (s_ptr + 4*S_v + tx*4),
++    };
++
++    device float * dst_attn = (device float *) dst + (i23*args.ne22*args.ne21 + i21)*S_v + i20;
++    device const float * q_ptr = (device const float *) (q + i23*args.nb03 + i01*args.nb01);
++    device const float * k_ptr = (device const float *) (k + i23*args.nb13 + i11*args.nb11);
++    device const float * v_ptr = (device const float *) (v + i23*args.nb23 + i21*args.nb21);
++    device const float * b_ptr = (device const float *) b + (i23*args.ne22*args.ne21 + i21);
++    device const float * g_ptr = (device const float *) g + (i23*args.ne22*args.ne21 + i21)*G;
++
++    const uint attn_size = args.ne22 * args.ne21 * S_v * args.ne23;
++    const uint state_size_per_snap = S_v * S_v * args.ne21 * args.ne23;
++
++    for (short t = 0; t < args.ne22; t++) {
++        float4 g_exp;
++        if (G == 1) {
++            g_exp = float4(exp(g_ptr[0]));
++        } else {
++            FOR_UNROLL (short j = 0; j < 4; j++) {
++                g_exp[j] = exp(g_ptr[tx*4 + j]);
++            }
++        }
++
++        const float4 k4 = *(device const float4 *) (k_ptr + tx*4);
++        const float beta = b_ptr[0];
++        float d[2];
++        FOR_UNROLL (short r = 0; r < 2; r++) {
++            float s_k = 0.0f;
++            FOR_UNROLL (short j = 0; j < 4; j++) {
++                ls[r][j] *= g_exp[j];
++            }
++            FOR_UNROLL (short j = 0; j < 4; j++) {
++                s_k += ls[r][j]*k4[j];
++            }
++            s_k = gdn_sum32(s_k);
++            d[r] = (v_ptr[i20 + r*4] - s_k)*beta;
++        }
++
++        const float4 q4 = *(device const float4 *) (q_ptr + tx*4);
++        FOR_UNROLL (short r = 0; r < 2; r++) {
++            float y = 0.0f;
++            FOR_UNROLL (short j = 0; j < 4; j++) {
++                ls[r][j] += k4[j]*d[r];
++                y += ls[r][j]*q4[j];
++            }
++            y = gdn_sum32(y);
++            if (tx == 0) {
++                dst_attn[t*args.ne21*S_v + r*4] = y*scale;
++            }
++        }
++
++        q_ptr += args.ns02;
++        k_ptr += args.ns12;
++        v_ptr += args.ns22;
++        b_ptr += args.ne21;
++        g_ptr += args.ne21*G;
++
++        if (K > 1) {
++            const int target_slot = (int)args.ne22 - 1 - (int)t;
++            if (target_slot >= 0 && target_slot < (int)K) {
++                device float * dst_state = (device float *) dst + attn_size + (uint)target_slot*state_size_per_snap + state_base;
++                FOR_UNROLL (short r = 0; r < 2; r++) {
++                    *(device float4 *) (dst_state + r*4*S_v + tx*4) = ls[r];
++                }
++            }
++        }
++    }
++
++    if (K == 1) {
++        device float * dst_state = (device float *) dst + attn_size + state_base;
++        FOR_UNROLL (short r = 0; r < 2; r++) {
++            *(device float4 *) (dst_state + r*4*S_v + tx*4) = ls[r];
++        }
++    }
++#undef S_v
++#undef G
++#undef K
++}
++
+ #else
+ // a simplified version of the above
+ // no performance improvement, so keep the above version for now
+ 
+ template<typename T, short NSG>
+ kernel void kernel_gated_delta_net_impl(
+         constant ggml_metal_kargs_gated_delta_net & args,
+         device const char * q,
