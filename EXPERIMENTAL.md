@@ -87,3 +87,15 @@ Rebuild source-matched embedded and precompiled shaders for the selected final
 tree. The prior 25-library diagnostic bundle lacks the rows2 entrypoint and must
 not be reused as if it matched these experimental kernels. The installed app
 and runtime activation options are handled separately by the designated operator.
+
+## Installed Mac checkpoint
+
+The Mac's installed app is now v0.87.3 with the five candidates above and the
+existing v8 telemetry overlay. All four LLM tools and 25 Metal libraries built;
+one targeted GDN CPU-reference case and a short app-level MTP completion passed.
+The generated vendor trees in both development checkouts also have 0069-0073
+applied. This does not promote the earlier parity or performance qualifications.
+
+See the [deployment report](https://github.com/malzzz/model-experiments/blob/main/vega-duo-diag/app-v0873-experimental/REPORT.md)
+for the runtime state and private rollback location. Use the patched update
+workflow; the stock in-app updater alone would replace the experimental engine.
