@@ -1,0 +1,89 @@
+# Experimental Vega QSA handoff and sparse-padding correction
+# Base: ToshLLM v0.87.3 custom series through 0073; llama.cpp 465e49b9.
+# QSA is limited to measured Vega II Duo layer/decode shapes at KV extent >=8192.
+# TOSH_QSA_HANDOFF=0 (or an invalid nonempty value) retains the prior graph path.
+# Native evidence: model-experiments/vega-duo-diag/qsa-handoff/2026-09-13-fix/.
+# The padding predicate applies to the existing AMD sparse kernel independently.
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1,10 +1,52 @@
+ #include "models.h"
++#include "llama-cparams.h"
+ #include "llama-impl.h"
+ #include "llama-memory-hybrid-idx.h"
+ #include "llama-memory-recurrent.h"
+ 
+ #include <algorithm>
+ #include <cinttypes>
++#include <cstdlib>
++#include <cstring>
++
++// Keep the first sparse QSA handoff in the measured Vega decode regime.
++static int64_t qwen4exp_qsa_sparse_hint(
++        const llama_model & model, const llama_cparams & cparams,
++        const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
++        const ggml_tensor * top_k, const ggml_tensor * mask, int il) {
++    const char * setting = std::getenv("TOSH_QSA_HANDOFF");
++    if (setting && setting[0] != '\0' && std::strcmp(setting, "1") != 0) {
++        return 0;
++    }
++    const char * fa = std::getenv("TOSH_FA_AMD");
++    const char * width = std::getenv("TOSH_METAL_SIMD_WIDTH");
++    if (!fa || std::strcmp(fa, "1") != 0 || !width || std::strcmp(width, "64") != 0 ||
++            !cparams.flash_attn || !cparams.offload_kqv || model.split_mode() != LLAMA_SPLIT_MODE_LAYER) {
++        return 0;
++    }
++    auto * dev = model.dev_layer(il);
++    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++    const char * desc = dev ? ggml_backend_dev_description(dev) : nullptr;
++    const bool vega_duo = desc && (std::strcmp(desc, "AMD Radeon Pro Vega II Duo") == 0 ||
++        std::strncmp(desc, "AMD Radeon Pro Vega II Duo (dev p", sizeof("AMD Radeon Pro Vega II Duo (dev p") - 1) == 0);
++    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "MTL") != 0 || !vega_duo) {
++        return 0;
++    }
++
++    // Before build_attn_mha: Q=[D,H,tokens,1], K/V=[D,KVH,KV extent,streams].
++    // The extent can include up to 255 padding rows; this is not a live-token threshold.
++    const bool shape_ok =
++        q->type == GGML_TYPE_F32 && q->ne[0] == 256 && q->ne[1] == 24 && q->ne[2] == 1 && q->ne[3] == 1 &&
++        k->ne[0] == 256 && k->ne[1] == 2 && k->ne[2] >= 8192 && k->ne[3] == 1 &&
++        v->ne[0] == 256 && v->ne[1] == 2 && v->ne[2] == k->ne[2] && v->ne[3] == 1 &&
++        top_k->ne[0] > 0 && top_k->ne[0] <= 2051 && top_k->ne[0] < k->ne[2] &&
++        top_k->ne[1] == 1 && top_k->ne[2] == 1 && top_k->ne[3] == 1 &&
++        mask->ne[0] == k->ne[2] && mask->ne[1] == 1 && mask->ne[2] == 1 && mask->ne[3] == 1;
++    const bool types_ok =
++        (k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) ||
++        (k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_TURBO4_0);
++    return shape_ok && types_ok ? top_k->ne[0] : 0;
++}
+ 
+ // bad metadata must be catchable: GGML_ASSERT aborts the whole process
+ static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
+@@ -831,10 +873,8 @@
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+ 
+-    // TODO: enable sparse attention when we are ready
+-    // ref: https://github.com/ggml-org/llama.cpp/pull/27970
+-    //ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
+-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il);
++    const int64_t n_kv_max = qwen4exp_qsa_sparse_hint(model, cparams, q, k, v, top_k, kq_mask_top_k, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, n_kv_max, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     // the rotation is its own inverse, so undo it on the value side of the output
+diff --git a/ggml/src/ggml-metal/kernels/fa.metal b/ggml/src/ggml-metal/kernels/fa.metal
+--- a/ggml/src/ggml-metal/kernels/fa.metal
++++ b/ggml/src/ggml-metal/kernels/fa.metal
+@@ -2566,7 +2566,8 @@
+         // skip is not uniform and the shuffle reduction below would diverge
+         const float mv = (has_sparse && i11 < 0) ? -MAXHALF
+                        : (args.has_mask ? (float) pm[i11] : 0.0f);
+-        const bool  msk = mv <= -1e30f;
++        // A finite -MAXHALF sentinel does not satisfy the mask threshold.
++        const bool  msk = (has_sparse && i11 < 0) || mv <= -1e30f;
+         if (RPS == 1 && msk) {
+             continue;
+         }

@@ -16,7 +16,7 @@ The v0.87.3 sync merges upstream `9a6c16c` and retains llama.cpp pin
 0058 (wave64 sparse-attention indices) and 0059 (fused-exchange event
 separation). Our preserved custom tail moves to 0060-0068; historical
 experiment/report IDs still use their original numbers. The user-requested
-experimental application build additionally appends 0069-0073 below.
+experimental application build additionally appends 0069-0074 below.
 
 | v0.87.1 number | v0.87.3 number | Custom patch |
 | --- | --- | --- |
@@ -34,7 +34,8 @@ The user has now explicitly requested that the retained experimental candidates
 be included in the installed Mac application to observe their behavior. The
 normal numeric build series therefore also includes 0069 (cached exchange
 preflight/fail-stop), 0070 (guarded GDN rows2), 0071 (GDN k-load reuse), 0072
-(MTP cap/accounting), and 0073 (Qwen4exp gather-before-HC). See
+(MTP cap/accounting), 0073 (Qwen4exp gather-before-HC), and 0074 (AMD sparse
+padding correction plus guarded Vega QSA handoff at KV extent >=8192). See
 [EXPERIMENTAL.md](EXPERIMENTAL.md) for exact source deltas, hashes, known failures
 and exclusions. Inclusion is experimental deployment authorization, not a new
 correctness or performance acceptance result.
