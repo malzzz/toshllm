@@ -1,0 +1,198 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 39106ce9f..fbc6162a5 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1416,18 +1416,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     // about to draft again: per-token catch-up decodes are pure overhead if no draft reads them
+     struct cold_row { llama_token id; llama_pos pos; };
+     std::vector<std::vector<cold_row>> cold_rows;
+     std::vector<std::vector<float>>    cold_h;
+ 
+     static constexpr size_t cold_max = 128;
+ 
+     bool  cold_defer = true;
+-    float acc_min    = 0.60f;
+-    int   probe_base = 8;
++    float acc_min    = 0.20f;
++    float ewma_alpha = 0.8f;
++    int   probe_base = 4;
+     int   probe_cap  = 24;
+ 
+     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
+         , params(params.draft)
+     {
+         auto * ctx_tgt = this->params.ctx_tgt;
+         auto * ctx_dft = this->params.ctx_dft;
+@@ -1498,17 +1499,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+ 
+         cold_rows.assign(n_seq, {});
+         cold_h.assign(n_seq, {});
+ 
+         cold_defer = getenv("TOSH_MTP_COLD_DEFER_DISABLE") == nullptr;
+         // 0.65 sat above the acceptance real content reaches, so it backed off where drafting
+         // still paid; 0.60 keeps the win and still catches the unpredictable case.
++        // on the 4-die GCN stack a drafted round at nd2 costs ~58 ms vs ~42 ms AR, so
++        // drafting breaks even near 0.19 token acceptance; 0.60 gated drafting to a 16%
++        // duty cycle at a healthy 0.62 rate. 0.20 still cuts off true collapses.
++        // fall alpha 0.8 (slow) with probe 4 recovers from 0-accept noise streaks
++        // without losing the durable cold-streak decay (gap still doubles).
+         acc_min    = getenv("TOSH_MTP_ACC_MIN")   ? (float) atof(getenv("TOSH_MTP_ACC_MIN"))   : acc_min;
++        ewma_alpha = getenv("TOSH_MTP_EWMA")      ? (float) atof(getenv("TOSH_MTP_EWMA"))      : ewma_alpha;
+         probe_base = getenv("TOSH_MTP_PROBE")     ?         atoi(getenv("TOSH_MTP_PROBE"))     : probe_base;
+         probe_cap  = getenv("TOSH_MTP_PROBE_CAP") ?         atoi(getenv("TOSH_MTP_PROBE_CAP")) : probe_cap;
+ 
+         i_last.assign(n_seq, -1);
+         i_batch_beg.assign(n_seq, -1);
+         i_batch_end.assign(n_seq, -1);
+ 
+         verify_h.assign(n_seq, {});
+@@ -1972,19 +1979,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     }
+ 
+     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+             return;
+         }
+ 
+         if ((int) acc_ewma.size() == (int) n_seq && n_last_draft[seq_id] > 0) {
+-            static const float alpha = getenv("TOSH_MTP_EWMA") ? (float) atof(getenv("TOSH_MTP_EWMA")) : 0.5f;
+             const float acc = std::min(1.0f, (float) n_accepted / (float) n_last_draft[seq_id]);
+-            const float a = acc > acc_ewma[seq_id] ? 0.2f : alpha;  // rise fast, fall at alpha
++            const float a = acc > acc_ewma[seq_id] ? 0.2f : ewma_alpha;  // rise fast, fall at alpha
+             acc_ewma[seq_id] = a * acc_ewma[seq_id] + (1.0f - a) * acc;
+             n_last_draft[seq_id] = 0;
+         }
+ 
+         const int32_t n_rows = verify_h_rows[seq_id];
+         if (n_rows <= 0) {
+             return;
+         }
+diff --git a/examples/speculative-simple/speculative-simple.cpp b/examples/speculative-simple/speculative-simple.cpp
+index a7d6db3d7..5cf15a2ee 100644
+--- a/examples/speculative-simple/speculative-simple.cpp
++++ b/examples/speculative-simple/speculative-simple.cpp
+@@ -159,20 +159,25 @@ int main(int argc, char ** argv) {
+ 
+     const auto t_dec_start = ggml_time_us();
+ 
+     // temporary phase timing for the spec round (TOSH_SPEC_TIMING=1): host-logistics profiling
+     const bool spec_timing = getenv("TOSH_SPEC_TIMING") != nullptr;
+     double acc_draft = 0, acc_ckpt_save = 0, acc_verify = 0, acc_process = 0, acc_accept = 0,
+            acc_ckpt_load = 0, acc_postproc = 0, acc_seqrm = 0;
+     int n_rounds = 0, n_partials = 0;
++    // per-round economics: who drafted, who reused, who skipped; acceptance by depth
++    int n_fresh = 0, n_reuse = 0, n_skip = 0;
++    int acc_hist[16] = {0}; // rounds by accepted draft tokens (0..15)
++    double acc_verify_fresh = 0, acc_verify_reuse = 0;
+ 
+     while (true) {
+         auto t0 = spec_timing ? ggml_time_us() : 0;
+         auto t1 = t0, t2 = t0;
++        const bool entered_fresh = draft.empty(); // verify accounting: fresh draft vs reuse pass
+         // generate or reuse draft tokens
+         //
+         // this is the most important part of the speculation. the more probable tokens that are provided here
+         // the better the performance will be. in theory, this computation can be performed asynchronously and even
+         // offloaded to a remote device. it doesn't even have to be based on an LLM. instead, it can provide tokens
+         // from a cache or lookup tables.
+         //
+         if (draft.empty()) {
+@@ -199,16 +204,17 @@ int main(int argc, char ** argv) {
+                 /* .n_past     = */ n_past,
+                 /* .id_last    = */ id_last,
+                 /* .prompt     = */ &prompt_tgt,
+                 /* .result     = */ &draft, // output
+             };
+             t0 = spec_timing ? ggml_time_us() : 0;
+             common_speculative_draft(spec);
+             t1 = spec_timing ? ggml_time_us() : 0;
++            if (spec_timing) { if (draft.empty()) { n_skip++; } else { n_fresh++; } }
+ 
+             // save a checkpoint of the target context before evaluating the draft
+             // this allows us to restore the state if partial draft acceptance occurs
+             if (!draft.empty()) {
+                 if (use_ckpt_tgt) {
+                     ckpt.update_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                 }
+             }
+@@ -223,16 +229,17 @@ int main(int argc, char ** argv) {
+             }
+             t2 = spec_timing ? ggml_time_us() : 0;
+             if (spec_timing) { acc_draft += (t1-t0)/1e3; acc_ckpt_save += (t2-t1)/1e3; n_rounds++; }
+         } else {
+             // we have a previous (partial) draft to reuse from checkpoint restoration
+             if (use_ckpt_tgt) {
+                 GGML_ASSERT(!ckpt.empty());
+             }
++            if (spec_timing) { n_reuse++; }
+         }
+ 
+         // always have a token to evaluate from before - id_last
+         auto t3 = spec_timing ? ggml_time_us() : 0;
+         common_batch_clear(batch_tgt);
+         common_batch_add  (batch_tgt, id_last, n_past++, { seq_id }, true);
+ 
+         // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
+@@ -240,17 +247,17 @@ int main(int argc, char ** argv) {
+             for (size_t i = 0; i < draft.size(); ++i) {
+                 common_batch_add(batch_tgt, draft[i], n_past + i, { seq_id }, true);
+             }
+ 
+             //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
+ 
+             llama_decode(ctx_tgt, batch_tgt);
+             auto t4 = spec_timing ? ggml_time_us() : 0;
+-            if (spec_timing) { acc_verify += (t4-t3)/1e3; }
++            if (spec_timing) { acc_verify += (t4-t3)/1e3; if (entered_fresh) { acc_verify_fresh += (t4-t3)/1e3; } else { acc_verify_reuse += (t4-t3)/1e3; } }
+         }
+ 
+         auto t5 = spec_timing ? ggml_time_us() : 0;
+         // feed the batch to the speculative implementation(s) - this drives the draft model, MTP, Eagle3, etc.
+         if (!common_speculative_process(spec, batch_tgt)) {
+             LOG_ERR("%s", "failed to process speculative batch\n");
+             break;
+         }
+@@ -270,17 +277,17 @@ int main(int argc, char ** argv) {
+         //
+         // for each token to be accepted, the sampler would have to sample that same token
+         // in such cases, instead of decoding the sampled token as we normally do, we simply continue with the
+         // available logits from the batch and sample the next token until we run out of logits or the sampler
+         // disagrees with the draft
+         //
+         auto ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
+         auto t7 = spec_timing ? ggml_time_us() : 0;
+-        if (spec_timing) { acc_accept += (t7-t6)/1e3; }
++        if (spec_timing) { acc_accept += (t7-t6)/1e3; acc_hist[std::min((int) ids.size() - 1, 15)]++; }
+ 
+         //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
+ 
+         GGML_ASSERT(ids.size() > 0); // there will always be at least one accepted token
+ 
+         // check for partial draft acceptance:
+         // if the context doesn't support partial sequence removal, restore the checkpoint
+         // and make the accepted tokens the new partial draft for the next iteration
+@@ -370,16 +377,22 @@ int main(int argc, char ** argv) {
+ 
+     auto t_dec_end = ggml_time_us();
+ 
+     if (spec_timing) {
+         const double total = acc_draft + acc_ckpt_save + acc_verify + acc_process + acc_accept + acc_ckpt_load + acc_postproc + acc_seqrm;
+         LOG_INF("spec-timing (ms, %d rounds, %d partials): draft=%.1f ckpt_save=%.1f verify=%.1f process=%.1f accept=%.1f ckpt_load=%.1f postproc=%.1f seqrm=%.1f | accounted=%.1f of %.1f\n",
+                 n_rounds, n_partials, acc_draft, acc_ckpt_save, acc_verify, acc_process, acc_accept,
+                 acc_ckpt_load, acc_postproc, acc_seqrm, total, (t_dec_end - t_dec_start)/1e3);
++        // per-round economics table
++        LOG_INF("spec-econ: fresh=%d skip=%d reuse=%d | verify_fresh=%.1f ms verify_reuse=%.1f ms | ckpt %.1f MB | accept hist (draft tokens):",
++                n_fresh, n_skip, n_reuse, acc_verify_fresh, acc_verify_reuse, ckpt.size() / 1048576.0);
++        for (int i = 0; i < 16; ++i) {
++            if (acc_hist[i] > 0) { LOG_INF("spec-econ:   accepted %d: %d rounds", i, acc_hist[i]); }
++        }
+     }
+ 
+     const int n_input = inp.size();
+ 
+     LOG("\n\n");
+ 
+     LOG_INF("encoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_input,   (t_enc_end - t_enc_start) / 1e6f, inp.size() / ((t_enc_end - t_enc_start) / 1e6f));
+     LOG_INF("decoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_predict, (t_dec_end - t_dec_start) / 1e6f, n_predict  / ((t_dec_end - t_dec_start) / 1e6f));
