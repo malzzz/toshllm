@@ -401,10 +401,13 @@ struct ServerSettings {
                                       kvScale: Double, reserveMB: Int) -> Int {
         let kvPerToken = ModelSpec.kvBytesPerToken(atPath: path) * kvScale
         guard kvPerToken > 0, requested > 2048 else { return requested }
-        let vramGB = Double(ServerController.availableGPUs().map(\.vramMB).max() ?? 0) / 1024
+        // split modes spread weights and KV across every discrete GPU, so budget
+        // against the combined VRAM, not the largest single device
+        let gpus = ServerController.availableGPUs()
+        let vramGB = Double(gpus.map(\.vramMB).reduce(0, +)) / 1024
         guard vramGB > 0 else { return requested }
-        let budget = vramGB - Double(reserveMB) / 1024
-        let size = ((try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int64) ?? 0
+        let budget = vramGB - Double(reserveMB * max(1, gpus.count)) / 1024
+        let size = splitFileSize(atPath: path)
         let weightsGB = Double(size) / 1_073_741_824 * (ncmoe > 0 ? 0.45 : 1.0)
         let computeGB = 0.9
         var value = requested
@@ -413,6 +416,25 @@ struct ServerSettings {
             value /= 2
         }
         return value
+    }
+
+    /// File size of a GGUF, summing sibling shards for split files
+    /// (`name-0000N-of-0000M.gguf`); a single file costs its own size.
+    private nonisolated static func splitFileSize(atPath path: String) -> Int64 {
+        let fm = FileManager.default
+        let url = URL(fileURLWithPath: path)
+        let name = url.lastPathComponent
+        guard let m = name.range(of: #"-\d{5}-of-\d{5}\.gguf$"#, options: .regularExpression) else {
+            return Int64((try? fm.attributesOfItem(atPath: path))?[.size] as? Int ?? 0)
+        }
+        let base = String(name[..<m.lowerBound])
+        let dir = url.deletingLastPathComponent().path
+        let siblings = (try? fm.contentsOfDirectory(atPath: dir))?.filter {
+            $0.hasPrefix(base) && $0.hasSuffix(".gguf")
+        } ?? []
+        return siblings.reduce(Int64(0)) { acc, f in
+            acc + Int64((try? fm.attributesOfItem(atPath: dir + "/" + f))?[.size] as? Int ?? 0)
+        }
     }
 
     /// Router-mode CLI args: no `-m`, the preset file lists every model. Per-model
@@ -475,7 +497,7 @@ struct ServerSettings {
             seenAliases.insert(alias)
 
             let modelCtx = Self.routerCtx(forModel: path, requested: ctx, ncmoe: ncmoeByPath[path] ?? 0,
-                                          kvScale: Estimator.kvTypeScale(cacheTypeK),
+                                          kvScale: (Estimator.kvTypeScale(cacheTypeK) + Estimator.kvTypeScale(cacheTypeV)) / 2,
                                           reserveMB: vramReserveMB)
             var lines = ["[\(alias)]", "model = \(path)", "n-gpu-layers = \(ngl)",
                          "ctx-size = \(modelCtx)", "threads = \(threads)", "flash-attn = \(faValue)"]
