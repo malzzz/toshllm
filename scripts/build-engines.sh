@@ -52,9 +52,16 @@ if ! xcrun metal -v >/dev/null 2>&1 || ! xcrun -f metallib >/dev/null 2>&1; then
 fi
 resolve_metal_toolchain() {
     # Resolve the demand-mounted toolchain before each shader build.
-    xcrun metal -v >/dev/null 2>&1 || return 1
-    METAL_COMPILER="$(xcrun -f metal 2>/dev/null)" || return 1
-    METALLIB_COMPILER="$(xcrun -f metallib 2>/dev/null)" || return 1
+    # xcodebuild init is broken on this box (Xcode 12.4 plugins vs macOS 26),
+    # so fall back to the toolchain binaries directly when xcrun fails.
+    if xcrun metal -v >/dev/null 2>&1; then
+        METAL_COMPILER="$(xcrun -f metal 2>/dev/null)" || return 1
+        METALLIB_COMPILER="$(xcrun -f metallib 2>/dev/null)" || return 1
+    else
+        local tc=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin
+        METAL_COMPILER="$tc/metal"
+        METALLIB_COMPILER="$tc/metallib"
+    fi
     [ -x "$METAL_COMPILER" ] && [ -x "$METALLIB_COMPILER" ]
 }
 
